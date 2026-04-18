@@ -40,7 +40,7 @@ enum RunError {
     Output(anyhow::Error),
 }
 
-fn run(cli: Cli) -> Result<(), RunError> {
+fn run(mut cli: Cli) -> Result<(), RunError> {
     cli.validate().map_err(RunError::Input)?;
 
     let tokenizer: Box<dyn Tokenizer + Send + Sync> = match cli.tokenizer {

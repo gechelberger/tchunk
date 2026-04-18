@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+use indexmap::IndexSet;
 
 use crate::plan::BoundaryLevel;
 
@@ -97,14 +98,60 @@ pub struct Cli {
 }
 
 impl Cli {
-    /// Post-parse validation that clap can't express declaratively.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// Post-parse validation that clap can't express declaratively. Also expands
+    /// any glob patterns in `inputs` (shells on Windows don't glob, so the tool does).
+    pub fn validate(&mut self) -> anyhow::Result<()> {
+        self.expand_inputs()?;
+
         if self.prefix.is_some() && self.inputs.len() > 1 {
             anyhow::bail!(
                 "--prefix is ambiguous with multiple inputs ({} given); omit it so each input uses its own stem, or run tchunk-pdf once per file.",
                 self.inputs.len()
             );
         }
+        Ok(())
+    }
+
+    /// Expand any glob patterns in `self.inputs`. Literal paths pass through.
+    /// Rule: if the arg exists as a literal path, keep it as-is (protects
+    /// filenames that legally contain `[`/`*`/`?` on Unix). Else, if it
+    /// contains glob metacharacters, expand via `glob::glob`. Else, leave it
+    /// and let downstream loading produce the normal "not found" error.
+    ///
+    /// Zero matches for a pattern is a hard error. Duplicates across patterns
+    /// are deduped, preserving first-seen arg order.
+    fn expand_inputs(&mut self) -> anyhow::Result<()> {
+        let mut out: IndexSet<PathBuf> = IndexSet::with_capacity(self.inputs.len());
+
+        for arg in self.inputs.drain(..) {
+            if arg.exists() {
+                out.insert(arg);
+                continue;
+            }
+
+            let s = arg.to_string_lossy();
+            let is_pattern = s.contains(['*', '?', '[']);
+            if !is_pattern {
+                out.insert(arg);
+                continue;
+            }
+
+            let paths = glob::glob(&s)
+                .map_err(|e| anyhow::anyhow!("invalid glob pattern {s:?}: {e}"))?;
+            let mut matched = 0usize;
+            for entry in paths {
+                let p = entry.map_err(|e| {
+                    anyhow::anyhow!("error while expanding pattern {s:?}: {e}")
+                })?;
+                out.insert(p);
+                matched += 1;
+            }
+            if matched == 0 {
+                anyhow::bail!("no files matched pattern: {s}");
+            }
+        }
+
+        self.inputs = out.into_iter().collect();
         Ok(())
     }
 }
