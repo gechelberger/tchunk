@@ -153,7 +153,7 @@ Benchmark: [USCODE-2011-title26.pdf](https://www.govinfo.gov/content/pkg/USCODE-
 
 ## Limitations / deferred
 
-- No overlap window between chunks (planned for a later release).
+- **No overlap window between chunks.** When chunks are fed to a downstream LLM directly (RAG pipelines, do-it-yourself retrieval), it's common to have each chunk's start repeat the last few pages of the previous chunk so that passages spanning the cut are fully contained in at least one chunk. Not currently implemented because tchunk-pdf's primary target — NotebookLM and similar — does its own internal chunking and embedding over the source it's given, so a tchunk-pdf-level overlap would mostly add cost without changing what the downstream tool sees. If a use case shows up where outputs are consumed directly by an LLM context window, this is the right thing to add.
 - Rebalancing midsection cuts may not work as desired (planned).
 - No font-size-based heading detection for PDFs without an outline.
 - No OCR (use `ocrmypdf` upstream).
