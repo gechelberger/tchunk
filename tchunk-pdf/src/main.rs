@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -50,10 +50,13 @@ fn run(cli: Cli) -> Result<(), RunError> {
     let tokenizer = TiktokenTokenizer::new(cli.tokenizer.as_str()).map_err(RunError::Input)?;
 
     let extract_pb = spinner(&format!("Extracting text from {page_count} pages..."));
+    let t_extract = Instant::now();
     let texts = pdf.page_texts();
-    extract_pb.finish_and_clear();
+    let extract_elapsed = t_extract.elapsed();
+    extract_pb.finish();
 
     let tok_pb = page_bar(page_count as u64, "Tokenizing");
+    let t_tokenize = Instant::now();
     let tokens: Vec<usize> = texts
         .iter()
         .map(|t| {
@@ -62,9 +65,12 @@ fn run(cli: Cli) -> Result<(), RunError> {
             n
         })
         .collect();
-    tok_pb.finish_and_clear();
+    let tokenize_elapsed = t_tokenize.elapsed();
+    tok_pb.finish();
 
+    let t_images = Instant::now();
     let images = pdf.image_counts();
+    let images_elapsed = t_images.elapsed();
 
     emit_content_warnings(&cli.input, &tokens, &images);
 
@@ -131,6 +137,7 @@ fn run(cli: Cli) -> Result<(), RunError> {
         chunk_bar(total as u64, "Writing chunks")
     };
 
+    let t_write = Instant::now();
     for (i, page_nums) in plan.chunks.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{prefix}_{idx:0width$}.pdf", width = pad);
@@ -153,9 +160,32 @@ fn run(cli: Cli) -> Result<(), RunError> {
             .map_err(RunError::Output)?;
         write_pb.inc(1);
     }
-    write_pb.finish_and_clear();
+    write_pb.finish();
+    let write_elapsed = t_write.elapsed();
+
+    eprintln!(
+        "timing: extract {} | tokenize {} | image-scan {} | write {} chunks {}",
+        fmt_dur(extract_elapsed),
+        fmt_dur(tokenize_elapsed),
+        fmt_dur(images_elapsed),
+        total,
+        fmt_dur(write_elapsed),
+    );
 
     Ok(())
+}
+
+fn fmt_dur(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs >= 60.0 {
+        let m = (secs / 60.0).floor() as u64;
+        let s = secs - (m as f64) * 60.0;
+        format!("{m}m{s:.1}s")
+    } else if secs >= 1.0 {
+        format!("{secs:.2}s")
+    } else {
+        format!("{}ms", d.as_millis())
+    }
 }
 
 fn spinner(msg: &str) -> ProgressBar {
@@ -174,7 +204,7 @@ fn page_bar(total: u64, label: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::with_template(
-            "{msg} [{bar:30.cyan/blue}] {pos}/{len} pages ({percent}%) eta {eta}",
+            "{msg} [{bar:30.cyan/blue}] {pos}/{len} pages ({percent}%) [{elapsed}/eta {eta}]",
         )
         .unwrap()
         .progress_chars("=>-"),
@@ -187,7 +217,7 @@ fn chunk_bar(total: u64, label: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::with_template(
-            "{msg} [{bar:30.cyan/blue}] {pos}/{len} chunks ({percent}%) eta {eta}",
+            "{msg} [{bar:30.cyan/blue}] {pos}/{len} chunks ({percent}%) [{elapsed}/eta {eta}]",
         )
         .unwrap()
         .progress_chars("=>-"),

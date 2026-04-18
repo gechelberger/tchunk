@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use indexmap::IndexMap;
 use lopdf::{Destination, Document, Object, ObjectId, Outline};
 
@@ -154,23 +154,75 @@ impl Pdf {
     }
 
     /// Write a new PDF containing only the given 1-based page numbers, preserving original page
-    /// content. Achieved by loading a fresh copy of the source bytes, deleting all other pages,
-    /// pruning unreferenced objects, then saving.
+    /// content. Avoids `delete_pages` (which is O(deleted × all_objects) due to per-page graph
+    /// traversal); instead, rebuilds the page tree directly to reference only the kept pages and
+    /// uses `prune_objects` to GC the orphans in a single pass.
     pub fn write_chunk(&self, keep: &[u32], out_path: &Path) -> Result<()> {
-        let mut doc = Document::load_mem(&self.bytes)
-            .context("failed to reload source PDF for chunk write")?;
-        let total_pages = self.pages.len() as u32;
-        let keep_set: std::collections::BTreeSet<u32> = keep.iter().copied().collect();
-        let to_delete: Vec<u32> = (1..=total_pages).filter(|p| !keep_set.contains(p)).collect();
-        if !to_delete.is_empty() {
-            doc.delete_pages(&to_delete);
-        }
-        doc.renumber_objects();
-        doc.compress();
+        let mut doc = self.doc.clone();
+        subset_to_pages(&mut doc, &self.pages, keep)?;
         doc.save(out_path)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
         Ok(())
     }
+}
+
+fn subset_to_pages(
+    doc: &mut Document,
+    pages: &BTreeMap<u32, ObjectId>,
+    keep: &[u32],
+) -> Result<()> {
+    let keep_set: BTreeSet<u32> = keep.iter().copied().collect();
+    let kept_ids: Vec<ObjectId> = pages
+        .iter()
+        .filter(|(n, _)| keep_set.contains(n))
+        .map(|(_, id)| *id)
+        .collect();
+    if kept_ids.is_empty() {
+        return Err(anyhow!("subset_to_pages called with empty keep list"));
+    }
+
+    let catalog_id = doc
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .map_err(|e| anyhow!("missing /Root in trailer: {e}"))?;
+    let pages_root_id = doc
+        .get_dictionary(catalog_id)
+        .and_then(|d| d.get(b"Pages"))
+        .and_then(Object::as_reference)
+        .map_err(|e| anyhow!("missing /Pages in catalog: {e}"))?;
+
+    // Repoint each kept page directly at the pages root, in case the original tree had
+    // intermediate Pages nodes that we're about to discard.
+    for &page_id in &kept_ids {
+        if let Ok(page_dict) = doc.get_object_mut(page_id).and_then(Object::as_dict_mut) {
+            page_dict.set("Parent", Object::Reference(pages_root_id));
+        }
+    }
+
+    // Replace the page tree's Kids/Count with our subset, flattened.
+    let new_kids: Vec<Object> = kept_ids.iter().map(|id| Object::Reference(*id)).collect();
+    let new_count = kept_ids.len() as i64;
+    if let Ok(pages_dict) = doc.get_object_mut(pages_root_id).and_then(Object::as_dict_mut) {
+        pages_dict.set("Kids", Object::Array(new_kids));
+        pages_dict.set("Count", new_count);
+    } else {
+        return Err(anyhow!("/Pages object is not a dictionary"));
+    }
+
+    // Drop the catalog's outline tree and named-destination tables — they reference pages we're
+    // dropping, and chunk-level navigation isn't useful anyway.
+    if let Ok(catalog_dict) = doc.get_object_mut(catalog_id).and_then(Object::as_dict_mut) {
+        catalog_dict.remove(b"Outlines");
+        catalog_dict.remove(b"Names");
+        catalog_dict.remove(b"Dests");
+        catalog_dict.remove(b"PageLabels");
+    }
+
+    // Single-pass GC of everything no longer reachable from the trailer.
+    doc.prune_objects();
+
+    Ok(())
 }
 
 fn resolve_page(
