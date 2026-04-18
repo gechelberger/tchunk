@@ -19,6 +19,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 lopdf = "0.36"
 tiktoken-rs = "0.7"
+tokenizers = { version = "0.20", default-features = false, features = ["onig", "http"] }
+hf-hub = "0.3"
 indexmap = "2"
 indicatif = "0.17"
 glob = "0.3"

@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use anyhow::Result;
 use tiktoken_rs::CoreBPE;
+use tokenizers::{FromPretrainedParameters, Tokenizer as HfTokenizer};
 
 pub trait Tokenizer {
     fn count(&self, text: &str) -> usize;
@@ -34,6 +37,70 @@ impl Tokenizer for TiktokenTokenizer {
 
     fn name(&self) -> &str {
         self.name
+    }
+}
+
+pub struct HuggingFaceTokenizer {
+    inner: HfTokenizer,
+    name: String,
+}
+
+impl HuggingFaceTokenizer {
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let inner = HfTokenizer::from_file(path).map_err(|e| {
+            anyhow::anyhow!("failed to load tokenizer from {}: {e}", path.display())
+        })?;
+        let basename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".into());
+        Ok(Self {
+            inner,
+            name: format!("huggingface:{basename}"),
+        })
+    }
+
+    pub fn from_model_id(model_id: &str) -> Result<Self> {
+        let params = hf_auth_token().map(|token| FromPretrainedParameters {
+            token: Some(token),
+            ..Default::default()
+        });
+        let inner = HfTokenizer::from_pretrained(model_id, params).map_err(|e| {
+            anyhow::anyhow!("failed to fetch tokenizer for model '{model_id}': {e}")
+        })?;
+        Ok(Self {
+            inner,
+            name: format!("huggingface:{model_id}"),
+        })
+    }
+}
+
+/// Auth token for HuggingFace Hub. Precedence matches the Python `huggingface_hub`
+/// library: `HF_TOKEN` env var (preferred) → `HUGGING_FACE_HUB_TOKEN` env var
+/// (legacy) → the cached token file written by `huggingface-cli login`
+/// (at `$HF_HOME/token`, default `~/.cache/huggingface/token`). Empty values at
+/// any level are treated as absent so the next source is tried.
+fn hf_auth_token() -> Option<String> {
+    for var in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    hf_hub::Cache::default().token()
+}
+
+impl Tokenizer for HuggingFaceTokenizer {
+    fn count(&self, text: &str) -> usize {
+        self.inner
+            .encode(text, false)
+            .expect("huggingface tokenizer failed to encode text")
+            .len()
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 

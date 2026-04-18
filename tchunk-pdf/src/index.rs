@@ -19,6 +19,7 @@ pub struct Index {
 pub struct Source {
     pub path: String,
     pub page_count: usize,
+    pub total_tokens: usize,
 }
 
 #[derive(Serialize)]
@@ -96,6 +97,7 @@ mod tests {
             source: Source {
                 path: "book.pdf".to_string(),
                 page_count: 10,
+                total_tokens: 1234,
             },
             config: Config {
                 tokenizer: "cl100k_base".to_string(),

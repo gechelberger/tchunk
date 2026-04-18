@@ -11,7 +11,7 @@ use tchunk_pdf::cli::{Cli, TokenizerKind};
 use tchunk_pdf::index::{self, ChunkEntry, Config, Index, Pages, Source, Warning};
 use tchunk_pdf::pdf::Pdf;
 use tchunk_pdf::plan::{plan_chunks, BoundaryLevel, Diagnostic};
-use tchunk_pdf::tokenize::{TiktokenTokenizer, Tokenizer, WordCountTokenizer};
+use tchunk_pdf::tokenize::{HuggingFaceTokenizer, TiktokenTokenizer, Tokenizer, WordCountTokenizer};
 
 const SCAN_LIKE_TOKEN_THRESHOLD: usize = 20;
 const SCAN_LIKE_PAGE_RATIO_PCT: usize = 50;
@@ -45,6 +45,16 @@ fn run(mut cli: Cli) -> Result<(), RunError> {
 
     let tokenizer: Box<dyn Tokenizer + Send + Sync> = match cli.tokenizer {
         TokenizerKind::WordCount => Box::new(WordCountTokenizer),
+        TokenizerKind::HuggingFace => {
+            let hf = if let Some(path) = cli.tokenizer_file.as_deref() {
+                HuggingFaceTokenizer::from_file(path)
+            } else if let Some(model_id) = cli.tokenizer_model.as_deref() {
+                HuggingFaceTokenizer::from_model_id(model_id)
+            } else {
+                unreachable!("Cli::validate guarantees one of --tokenizer-file / --tokenizer-model is set");
+            };
+            Box::new(hf.map_err(RunError::Input)?)
+        }
         other => Box::new(TiktokenTokenizer::new(other.as_str()).map_err(RunError::Input)?),
     };
 
@@ -241,6 +251,7 @@ fn process_input(
         source: Source {
             path: input.display().to_string(),
             page_count,
+            total_tokens: tokens.iter().sum(),
         },
         config: Config {
             tokenizer: tokenizer.name().to_string(),

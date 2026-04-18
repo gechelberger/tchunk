@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use indexmap::IndexSet;
 
 use crate::plan::BoundaryLevel;
@@ -27,7 +27,7 @@ impl From<SplitAt> for BoundaryLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TokenizerKind {
     #[value(name = "cl100k_base")]
     Cl100kBase,
@@ -35,6 +35,8 @@ pub enum TokenizerKind {
     O200kBase,
     #[value(name = "word_count")]
     WordCount,
+    #[value(name = "huggingface")]
+    HuggingFace,
 }
 
 impl TokenizerKind {
@@ -43,6 +45,7 @@ impl TokenizerKind {
             TokenizerKind::Cl100kBase => "cl100k_base",
             TokenizerKind::O200kBase => "o200k_base",
             TokenizerKind::WordCount => "word_count",
+            TokenizerKind::HuggingFace => "huggingface",
         }
     }
 }
@@ -51,7 +54,13 @@ impl TokenizerKind {
 #[command(
     name = "tchunk-pdf",
     about = "Split a PDF into smaller PDFs at page boundaries under a token budget.",
-    version
+    version,
+    group(
+        ArgGroup::new("hf_source")
+            .args(["tokenizer_file", "tokenizer_model"])
+            .multiple(false)
+            .required(false),
+    ),
 )]
 pub struct Cli {
     /// Input PDF file(s). Each is chunked independently; outputs for each input use
@@ -64,7 +73,7 @@ pub struct Cli {
     pub max_tokens: usize,
 
     /// Coarsest level at which a split between chunks is allowed. Outline-based levels
-    /// (chapter/section/subsection/any-bookmark) require the PDF to have a bookmarks tree;
+    /// require the PDF to have a bookmarks tree;
     /// otherwise they fall back to `page` with a warning.
     #[arg(short = 's', long, value_enum, default_value_t = SplitAt::Page)]
     pub split_at: SplitAt,
@@ -79,8 +88,18 @@ pub struct Cli {
     pub prefix: Option<String>,
 
     /// Tokenizer used to count tokens per page.
-    #[arg(short = 't', long, value_enum, default_value_t = TokenizerKind::Cl100kBase)]
+    #[arg(short = 't', long, value_enum, default_value_t = TokenizerKind::O200kBase)]
     pub tokenizer: TokenizerKind,
+
+    /// Path to a HuggingFace tokenizer.json. Requires `-t huggingface`.
+    #[arg(long = "tokenizer-file", value_name = "PATH")]
+    pub tokenizer_file: Option<PathBuf>,
+
+    /// HuggingFace Hub model ID (e.g. `meta-llama/Llama-3-8B`) to fetch the tokenizer from.
+    /// First use downloads and caches under $HF_HOME (default ~/.cache/huggingface);
+    /// subsequent runs hit the cache. Requires `-t huggingface`.
+    #[arg(long = "tokenizer-model", value_name = "HF_MODEL_ID")]
+    pub tokenizer_model: Option<String>,
 
     /// Print per-chunk page ranges and token totals to stderr.
     #[arg(short = 'v', long, conflicts_with = "quiet")]
@@ -109,6 +128,19 @@ impl Cli {
                 self.inputs.len()
             );
         }
+
+        let has_hf_source = self.tokenizer_file.is_some() || self.tokenizer_model.is_some();
+        match self.tokenizer {
+            TokenizerKind::HuggingFace if !has_hf_source => anyhow::bail!(
+                "-t huggingface requires --tokenizer-file <PATH> or --tokenizer-model <HF_MODEL_ID>"
+            ),
+            TokenizerKind::HuggingFace => {}
+            _ if has_hf_source => anyhow::bail!(
+                "--tokenizer-file / --tokenizer-model only apply with -t huggingface"
+            ),
+            _ => {}
+        }
+
         Ok(())
     }
 

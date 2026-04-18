@@ -57,7 +57,7 @@ files) — run `tchunk-pdf` once per file in that case.
 | `-s`  | `--split-at`     | `page`        | Coarsest level a split is allowed at: `page`, `any-bookmark`, `subsection`, `section`, `chapter`. |
 | `-o`  | `--output-dir`   | `.`           | Output directory (created if missing). |
 | `-p`  | `--prefix`       | input stem    | Output filename prefix. Rejected if more than one input is given. |
-| `-t`  | `--tokenizer`    | `cl100k_base` | `cl100k_base` or `o200k_base`, or `word_count` |
+| `-t`  | `--tokenizer`    | `o200k_base`  | `cl100k_base`, `o200k_base`, `word_count`, or `huggingface` (see [Tokenizers](#tokenizers)). |
 | `-v`  | `--verbose`      | off           | Print per-chunk page ranges and token totals to stderr. |
 | `-q`  | `--quiet`        | off           | Suppress warnings on stderr. Errors still print; warnings remain in the index sidecar. |
 | `-j`  | `--jobs`         | `1`           | N threads for extract/tokenize/image-scan. `1` sequential, `0` auto-detect. |
@@ -82,9 +82,9 @@ Alongside the PDFs, a JSON sidecar is written at `{prefix}.index.json` describin
 {
   "tool": "tchunk-pdf",
   "version": "0.1.0",
-  "source": { "path": "my-book.pdf", "page_count": 320 },
+  "source": { "path": "my-book.pdf", "page_count": 320, "total_tokens": 1340552 },
   "config": {
-    "tokenizer": "cl100k_base",
+    "tokenizer": "o200k_base",
     "max_tokens": 500000,
     "split_at_requested": "chapter",
     "split_at_effective": "section"
@@ -113,15 +113,48 @@ Warning entries are tagged objects: `scan_like`, `image_dominant`, `outline_miss
 
 ## Tokenizers
 
-Three options, selected with `-t/--tokenizer`:
+Four options, selected with `-t/--tokenizer`:
 
-- **`cl100k_base`** (default) — tiktoken BPE used by GPT-3.5/4 and many other LLMs. Good general-purpose proxy for LLM token counts.
-- **`o200k_base`** — tiktoken BPE used by GPT-4o and newer OpenAI models.
+- **`o200k_base`** (default) — tiktoken BPE used by GPT-4o and newer OpenAI models. Good general-purpose proxy for modern LLM token counts.
+- **`cl100k_base`** — tiktoken BPE used by GPT-3.5/4 and many older LLMs.
 - **`word_count`** — whitespace-split word count with non-alphanumeric chars treated as word boundaries (so `"hello,world"` is 2, `"don't"` is 2). Simple and fast, no model data loaded. Useful when you want "words per chunk" as the budget unit rather than LLM tokens.
+- **`huggingface`** — any tokenizer that ships a `tokenizer.json` (Llama, Mistral, Gemma, Qwen, DeepSeek, BERT-family, etc.). Requires either `--tokenizer-file <PATH>` or `--tokenizer-model <HF_MODEL_ID>`.
 
 NotebookLM doesn't publish its tokenizer, so the BPE options are generic LLM-token proxies — close enough for sizing, not exact.
 
 Per-page text is extracted via `lopdf::Document::extract_text`, which is fast but lower fidelity than dedicated extractors. For our purposes — *counting* tokens to size chunks — approximate is fine; a few percent off doesn't change which side of the budget a chunk lands on.
+
+### HuggingFace tokenizers
+
+```sh
+# from a local tokenizer.json
+tchunk-pdf -t huggingface --tokenizer-file ./llama3-tokenizer.json my-book.pdf
+
+# fetched once from the Hub and cached for subsequent runs
+tchunk-pdf -t huggingface --tokenizer-model meta-llama/Meta-Llama-3-8B my-book.pdf
+
+# ungated model, good for a first smoke test
+tchunk-pdf -t huggingface --tokenizer-model gpt2 my-book.pdf
+```
+
+**Finding a model**: there's no built-in listing. Browse <https://huggingface.co/models>, filter by task, and look for a `tokenizer.json` in the repo's Files tab. Any repo that has one will work. Repos with only `vocab.txt` / `sentencepiece.model` and no `tokenizer.json` won't.
+
+**Caching**: `--tokenizer-model` caches under `$HF_HOME/hub` (default `~/.cache/huggingface/hub`).
+
+**Gated models** (Llama, Gemma, some Mistral) require you to accept the model's license on the Hub and authenticate. tchunk-pdf looks for a token in this order (matching the Python `huggingface_hub` library):
+
+1. `HF_TOKEN` env var
+2. `HUGGING_FACE_HUB_TOKEN` env var (legacy)
+3. `$HF_HOME/token` file, written by `huggingface-cli login`
+
+```sh
+export HF_TOKEN=hf_xxx...
+# or: huggingface-cli login   (one-time, writes ~/.cache/huggingface/token)
+# or: $env:HF_TOKEN = "hf_xxx"   (powershell)
+tchunk-pdf -t huggingface --tokenizer-model meta-llama/Meta-Llama-3-8B my-book.pdf
+```
+
+The index sidecar records the tokenizer as `huggingface:<basename>` for file-based runs or `huggingface:<model_id>` for Hub-fetched ones, so you can tell after the fact which tokenizer a chunk set was sized against.
 
 ## Warnings
 
