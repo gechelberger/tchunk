@@ -20,7 +20,7 @@ cargo build --release -p tchunk-pdf
 ## Usage
 
 ```sh
-tchunk-pdf <INPUT.pdf> [OPTIONS]
+tchunk-pdf <INPUT.pdf>... [OPTIONS]
 ```
 
 Common cases:
@@ -37,7 +37,17 @@ tchunk-pdf my-book.pdf --split-at chapter
 
 # verbose: per-chunk page ranges and token totals
 tchunk-pdf my-book.pdf -v
+
+# multiple inputs: each is chunked independently, outputs keyed by that input's stem
+tchunk-pdf book-a.pdf book-b.pdf -o ./out/
 ```
+
+### Multiple inputs
+
+Any number of input PDFs may be passed; each is processed independently and writes its
+own `{stem}_NNN.pdf` chunks and `{stem}.index.json` sidecar into `--output-dir`. `--prefix`
+is rejected as an error when more than one input is given (it would be ambiguous across
+files) — run `tchunk-pdf` once per file in that case.
 
 ### Options
 
@@ -46,7 +56,7 @@ tchunk-pdf my-book.pdf -v
 | `-m`  | `--max-tokens`   | `500000`      | Target maximum tokens per output chunk. |
 | `-s`  | `--split-at`     | `page`        | Coarsest level a split is allowed at: `page`, `any-bookmark`, `subsection`, `section`, `chapter`. |
 | `-o`  | `--output-dir`   | `.`           | Output directory (created if missing). |
-| `-p`  | `--prefix`       | input stem    | Output filename prefix. |
+| `-p`  | `--prefix`       | input stem    | Output filename prefix. Rejected if more than one input is given. |
 | `-t`  | `--tokenizer`    | `cl100k_base` | `cl100k_base` or `o200k_base`, or `word_count` |
 | `-v`  | `--verbose`      | off           | Print per-chunk page ranges and token totals to stderr. |
 | `-q`  | `--quiet`        | off           | Suppress warnings on stderr. Errors still print; warnings remain in the index sidecar. |
@@ -159,7 +169,7 @@ Benchmark: [USCODE-2011-title26.pdf](https://www.govinfo.gov/content/pkg/USCODE-
 - No font-size-based heading detection for PDFs without an outline.
 - No OCR (use `ocrmypdf` upstream).
 - Encrypted PDFs are not supported.
-- No streaming `stdin` input or multi-file input.
+- No streaming `stdin` input.
 
 ## License
 

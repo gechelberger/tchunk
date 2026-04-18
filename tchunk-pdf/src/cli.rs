@@ -53,8 +53,10 @@ impl TokenizerKind {
     version
 )]
 pub struct Cli {
-    /// Input PDF file.
-    pub input: PathBuf,
+    /// Input PDF file(s). Each is chunked independently; outputs for each input use
+    /// that input's own stem as the filename prefix.
+    #[arg(required = true, num_args = 1..)]
+    pub inputs: Vec<PathBuf>,
 
     /// Target maximum tokens per output chunk.
     #[arg(short = 'm', long, default_value_t = 500_000)]
@@ -70,7 +72,8 @@ pub struct Cli {
     #[arg(short = 'o', long, default_value = ".")]
     pub output_dir: PathBuf,
 
-    /// Output filename prefix. Defaults to the input file's stem.
+    /// Output filename prefix. Defaults to the input file's stem. Cannot be used
+    /// when more than one input is given — rerun per file, or omit this flag.
     #[arg(short = 'p', long)]
     pub prefix: Option<String>,
 
@@ -91,4 +94,17 @@ pub struct Cli {
     /// auto-detect (use all available cores). Chunk writing stays sequential.
     #[arg(short = 'j', long, default_value_t = 1)]
     pub jobs: usize,
+}
+
+impl Cli {
+    /// Post-parse validation that clap can't express declaratively.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.prefix.is_some() && self.inputs.len() > 1 {
+            anyhow::bail!(
+                "--prefix is ambiguous with multiple inputs ({} given); omit it so each input uses its own stem, or run tchunk-pdf once per file.",
+                self.inputs.len()
+            );
+        }
+        Ok(())
+    }
 }

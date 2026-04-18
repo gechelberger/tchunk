@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -41,14 +41,7 @@ enum RunError {
 }
 
 fn run(cli: Cli) -> Result<(), RunError> {
-    let pdf = Pdf::load(&cli.input).map_err(RunError::Input)?;
-    let page_count = pdf.page_count();
-    if page_count == 0 {
-        return Err(RunError::Input(anyhow::anyhow!(
-            "PDF contains no pages: {}",
-            cli.input.display()
-        )));
-    }
+    cli.validate().map_err(RunError::Input)?;
 
     let tokenizer: Box<dyn Tokenizer + Send + Sync> = match cli.tokenizer {
         TokenizerKind::WordCount => Box::new(WordCountTokenizer),
@@ -56,6 +49,35 @@ fn run(cli: Cli) -> Result<(), RunError> {
     };
 
     let pool = build_pool(cli.jobs).map_err(RunError::Input)?;
+
+    let multi = cli.inputs.len() > 1;
+    for (idx, input) in cli.inputs.iter().enumerate() {
+        if multi {
+            if idx > 0 {
+                eprintln!();
+            }
+            eprintln!("=== {} ({}/{}) ===", input.display(), idx + 1, cli.inputs.len());
+        }
+        process_input(&cli, input, &pool, tokenizer.as_ref())?;
+    }
+    Ok(())
+}
+
+fn process_input(
+    cli: &Cli,
+    input: &Path,
+    pool: &ThreadPool,
+    tokenizer: &(dyn Tokenizer + Send + Sync),
+) -> Result<(), RunError> {
+    let pdf = Pdf::load(input).map_err(RunError::Input)?;
+    let page_count = pdf.page_count();
+    if page_count == 0 {
+        return Err(RunError::Input(anyhow::anyhow!(
+            "PDF contains no pages: {}",
+            input.display()
+        )));
+    }
+
     let page_nums = pdf.page_nums();
 
     let extract_pb = spinner(&format!("Extracting text from {page_count} pages..."));
@@ -94,7 +116,7 @@ fn run(cli: Cli) -> Result<(), RunError> {
     let images_elapsed = t_images.elapsed();
 
     let mut warnings: Vec<Warning> = Vec::new();
-    warnings.extend(emit_content_warnings(&cli.input, &tokens, &images, cli.quiet));
+    warnings.extend(emit_content_warnings(input, &tokens, &images, cli.quiet));
 
     let requested_split_at: BoundaryLevel = cli.split_at.into();
     let mut split_at = requested_split_at;
@@ -138,10 +160,9 @@ fn run(cli: Cli) -> Result<(), RunError> {
         }
     }
 
-    let prefix = match cli.prefix {
-        Some(p) => p,
-        None => cli
-            .input
+    let prefix = match &cli.prefix {
+        Some(p) => p.clone(),
+        None => input
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("chunk")
@@ -213,7 +234,7 @@ fn run(cli: Cli) -> Result<(), RunError> {
         tool: "tchunk-pdf",
         version: env!("CARGO_PKG_VERSION"),
         source: Source {
-            path: cli.input.display().to_string(),
+            path: input.display().to_string(),
             page_count,
         },
         config: Config {
