@@ -149,14 +149,6 @@ fn process_input(
                 }
                 warnings.push(Warning::OversizedPage { page: *page, tokens: *t });
             }
-            Diagnostic::ForcedMidLevelCut { after_page } => {
-                if !cli.quiet {
-                    eprintln!(
-                        "warning: forced page-level cut after page {after_page} — no allowed cut at --split-at level was reachable within budget."
-                    );
-                }
-                warnings.push(Warning::ForcedMidLevelCut { after_page: *after_page });
-            }
         }
     }
 
@@ -194,11 +186,12 @@ fn process_input(
 
     let t_write = Instant::now();
     let mut chunk_entries: Vec<ChunkEntry> = Vec::with_capacity(total);
-    for (i, page_nums) in plan.chunks.iter().enumerate() {
+    for (i, chunk) in plan.chunks.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{prefix}_{idx:0width$}.pdf", width = pad);
         let out_path: PathBuf = cli.output_dir.join(&filename);
 
+        let page_nums = &chunk.pages;
         let tok_sum: usize = page_nums
             .iter()
             .map(|&p| tokens[(p - 1) as usize])
@@ -208,8 +201,9 @@ fn process_input(
 
         if cli.verbose {
             eprintln!(
-                "  {filename}: pages {first}-{last} ({} pages, {tok_sum} tokens)",
-                page_nums.len()
+                "  {filename}: pages {first}-{last} ({} pages, {tok_sum} tokens, level {})",
+                page_nums.len(),
+                index::boundary_level_str(chunk.effective_level),
             );
         }
 
@@ -225,10 +219,21 @@ fn process_input(
                 count: page_nums.len(),
             },
             token_count: tok_sum,
+            effective_level: index::boundary_level_str(chunk.effective_level),
         });
     }
     write_pb.finish();
     let write_elapsed = t_write.elapsed();
+
+    // split_at_effective reports the finest level actually used across chunks, so a user can
+    // see at a glance whether their requested level was honored everywhere (same as requested)
+    // or whether any unit had to be recursed to a finer level (shows the finest such level).
+    let effective_level = plan
+        .chunks
+        .iter()
+        .map(|c| c.effective_level)
+        .min()
+        .unwrap_or(split_at);
 
     let index = Index {
         tool: "tchunk-pdf",
@@ -241,7 +246,7 @@ fn process_input(
             tokenizer: tokenizer.name().to_string(),
             max_tokens: cli.max_tokens,
             split_at_requested: index::boundary_level_str(requested_split_at),
-            split_at_effective: index::boundary_level_str(split_at),
+            split_at_effective: index::boundary_level_str(effective_level),
         },
         chunks: chunk_entries,
         warnings,

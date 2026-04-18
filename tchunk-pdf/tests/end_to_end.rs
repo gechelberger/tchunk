@@ -90,12 +90,13 @@ fn split_six_page_pdf_into_three_chunks_preserves_pages() {
     let plan = plan_chunks(&tokens, &boundaries, BoundaryLevel::Page, budget);
 
     // Sum of chunk pages == input pages, each page appears exactly once, ordered.
-    let flat: Vec<u32> = plan.chunks.iter().flatten().copied().collect();
+    let flat: Vec<u32> = plan.chunks.iter().flat_map(|c| c.pages.clone()).collect();
     assert_eq!(flat, (1..=6).collect::<Vec<_>>(), "pages reordered or lost");
     assert!(plan.chunks.len() >= 2, "expected multiple chunks, got {}", plan.chunks.len());
 
     // Write each chunk and verify its page count matches the plan.
-    for (i, page_nums) in plan.chunks.iter().enumerate() {
+    for (i, chunk) in plan.chunks.iter().enumerate() {
+        let page_nums = &chunk.pages;
         let out_path: PathBuf = dir.join(format!("out_{}.pdf", i + 1));
         pdf.write_chunk(page_nums, &out_path).expect("write_chunk");
 
@@ -141,10 +142,10 @@ fn single_chunk_when_budget_exceeds_total() {
 
     let plan = plan_chunks(&tokens, &boundaries, BoundaryLevel::Page, 10_000);
     assert_eq!(plan.chunks.len(), 1);
-    assert_eq!(plan.chunks[0], vec![1, 2, 3]);
+    assert_eq!(plan.chunks[0].pages, vec![1, 2, 3]);
 
     let out_path = dir.join("out.pdf");
-    pdf.write_chunk(&plan.chunks[0], &out_path).unwrap();
+    pdf.write_chunk(&plan.chunks[0].pages, &out_path).unwrap();
     let reloaded = Pdf::load(&out_path).unwrap();
     assert_eq!(reloaded.page_count(), 3);
 }
@@ -189,7 +190,8 @@ fn cli_writes_index_sidecar_with_chunk_entries() {
     let chunks = v["chunks"].as_array().expect("chunks array");
     assert!(!chunks.is_empty());
 
-    // Chunks must cover pages 1..=6 contiguously with no gaps/overlap.
+    // Chunks must cover pages 1..=6 contiguously with no gaps/overlap, and each must carry a
+    // per-chunk effective_level in the sidecar.
     let mut expected_next: u64 = 1;
     for c in chunks {
         let start = c["pages"]["start"].as_u64().unwrap();
@@ -198,6 +200,11 @@ fn cli_writes_index_sidecar_with_chunk_entries() {
         assert_eq!(start, expected_next, "chunk start/gap mismatch");
         assert_eq!(end - start + 1, count, "pages.count mismatch");
         assert!(c["filename"].as_str().unwrap().ends_with(".pdf"));
+        assert_eq!(
+            c["effective_level"].as_str(),
+            Some("page"),
+            "chunk missing or wrong effective_level: {c:?}"
+        );
         expected_next = end + 1;
     }
     assert_eq!(expected_next, 7, "chunks did not cover all 6 pages");

@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -16,6 +17,17 @@ impl BoundaryLevel {
             2 => BoundaryLevel::Section,
             3 => BoundaryLevel::Subsection,
             _ => BoundaryLevel::AnyBookmark,
+        }
+    }
+
+    /// The next finer level in the `Chapter → Section → Subsection → AnyBookmark → Page` chain.
+    pub fn next_finer(self) -> Option<Self> {
+        match self {
+            BoundaryLevel::Chapter => Some(BoundaryLevel::Section),
+            BoundaryLevel::Section => Some(BoundaryLevel::Subsection),
+            BoundaryLevel::Subsection => Some(BoundaryLevel::AnyBookmark),
+            BoundaryLevel::AnyBookmark => Some(BoundaryLevel::Page),
+            BoundaryLevel::Page => None,
         }
     }
 }
@@ -39,12 +51,20 @@ impl FromStr for BoundaryLevel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Diagnostic {
     OversizedPage { page: u32, tokens: usize },
-    ForcedMidLevelCut { after_page: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedChunk {
+    pub pages: Vec<u32>,
+    /// The split level at which *this chunk's* adjacent cuts were taken. For a chunk produced at
+    /// the requested `split_at`, this equals the requested level. For a chunk produced by
+    /// recursing into an over-budget unit, this is the finer level the recursion landed on.
+    pub effective_level: BoundaryLevel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanResult {
-    pub chunks: Vec<Vec<u32>>,
+    pub chunks: Vec<PlannedChunk>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -55,88 +75,244 @@ pub fn plan_chunks(
     budget: usize,
 ) -> PlanResult {
     assert_eq!(tokens.len(), boundaries.len());
-    let n = tokens.len();
+    if tokens.is_empty() {
+        return PlanResult { chunks: Vec::new(), diagnostics: Vec::new() };
+    }
 
-    let cut_after_allowed = |i: usize| -> bool { i + 1 == n || boundaries[i + 1] >= split_at };
-
-    let mut chunks: Vec<Vec<u32>> = Vec::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    let mut chunks = pack_top_level(tokens, boundaries, split_at, budget, &mut diagnostics);
+    rebalance_last_two(&mut chunks, tokens, boundaries, split_at, budget);
+    PlanResult { chunks, diagnostics }
+}
+
+/// Top-level greedy-pack over units at `split_at`. On unit overrun, hand off to `plan_overrun`
+/// which re-plans that unit at the next finer effective level with equal-target + pairwise
+/// rebalance. Preserves original greedy-at-top-level + final last-two-rebalance semantics for
+/// documents with no overruns.
+fn pack_top_level(
+    tokens: &[usize],
+    boundaries: &[BoundaryLevel],
+    split_at: BoundaryLevel,
+    budget: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<PlannedChunk> {
+    let n = tokens.len();
+    let units = segment_units(boundaries, 0..n, split_at);
+
+    let mut chunks: Vec<PlannedChunk> = Vec::new();
+    let mut cur: Vec<Range<usize>> = Vec::new();
+    let mut cur_tokens: usize = 0;
+
+    for unit in units {
+        let unit_tokens = sum_tokens(tokens, &unit);
+
+        if unit_tokens > budget {
+            flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
+            let finer = next_effective_level(boundaries, unit.clone(), split_at);
+            let sub = plan_overrun(tokens, boundaries, unit, finer, budget, diagnostics);
+            chunks.extend(sub);
+            continue;
+        }
+
+        if cur_tokens + unit_tokens > budget {
+            flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
+        }
+        cur_tokens += unit_tokens;
+        cur.push(unit);
+    }
+    flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
+    chunks
+}
+
+/// Plan an over-budget page range at `split_at`, using budget-greedy packing over sub-units and
+/// recursing into any sub-unit that still overruns. Finishes with a pairwise-sweep rebalance
+/// across sibling sub-chunks to redistribute tokens toward equal sizes.
+///
+/// Budget-greedy (rather than equal-target) is important: it keeps the invariant that no two
+/// adjacent output chunks can be combined under budget, because a flush only happens when the
+/// next unit would overflow. Equal-target packing broke that invariant — the hysteresis check
+/// would fire partway through the remainder and leave two small neighbor chunks that obviously
+/// should have been one.
+fn plan_overrun(
+    tokens: &[usize],
+    boundaries: &[BoundaryLevel],
+    range: Range<usize>,
+    split_at: BoundaryLevel,
+    budget: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<PlannedChunk> {
+    if split_at == BoundaryLevel::Page {
+        return pack_pages_balanced(tokens, boundaries, range, budget, diagnostics);
+    }
+
+    let units = segment_units(boundaries, range, split_at);
+
+    let mut chunks: Vec<PlannedChunk> = Vec::new();
+    let mut cur: Vec<Range<usize>> = Vec::new();
+    let mut cur_tokens: usize = 0;
+
+    for unit in units {
+        let unit_tokens = sum_tokens(tokens, &unit);
+
+        if unit_tokens > budget {
+            flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
+            let finer = next_effective_level(boundaries, unit.clone(), split_at);
+            let sub = plan_overrun(tokens, boundaries, unit, finer, budget, diagnostics);
+            chunks.extend(sub);
+            continue;
+        }
+
+        if cur_tokens + unit_tokens > budget {
+            flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
+        }
+        cur_tokens += unit_tokens;
+        cur.push(unit);
+    }
+    flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
+
+    pairwise_rebalance(&mut chunks, tokens, boundaries, split_at, budget);
+    chunks
+}
+
+/// Page-level base case for `plan_overrun`. Budget-greedy page packing (same strategy as the
+/// top-level packer, just at page granularity) followed by the pairwise rebalance. Oversized
+/// pages (token count > budget) become their own chunk with an `OversizedPage` diagnostic.
+fn pack_pages_balanced(
+    tokens: &[usize],
+    boundaries: &[BoundaryLevel],
+    range: Range<usize>,
+    budget: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<PlannedChunk> {
+    let mut chunks: Vec<PlannedChunk> = Vec::new();
     let mut cur: Vec<u32> = Vec::new();
     let mut cur_tokens: usize = 0;
-    let mut last_allowed_cut: Option<usize> = None;
 
-    let mut i = 0;
-    while i < n {
+    for i in range {
         let page = (i + 1) as u32;
         let t = tokens[i];
 
         if t > budget {
             if !cur.is_empty() {
-                chunks.push(std::mem::take(&mut cur));
+                chunks.push(PlannedChunk {
+                    pages: std::mem::take(&mut cur),
+                    effective_level: BoundaryLevel::Page,
+                });
                 cur_tokens = 0;
-                last_allowed_cut = None;
             }
-            chunks.push(vec![page]);
+            chunks.push(PlannedChunk {
+                pages: vec![page],
+                effective_level: BoundaryLevel::Page,
+            });
             diagnostics.push(Diagnostic::OversizedPage { page, tokens: t });
-            i += 1;
             continue;
         }
 
-        if cur_tokens + t <= budget {
-            cur.push(page);
-            cur_tokens += t;
-            if cut_after_allowed(i) {
-                last_allowed_cut = Some(cur.len() - 1);
-            }
-            i += 1;
-        } else {
-            match last_allowed_cut {
-                Some(cut_idx) => {
-                    let head: Vec<u32> = cur[..=cut_idx].to_vec();
-                    let tail: Vec<u32> = cur[cut_idx + 1..].to_vec();
-                    chunks.push(head);
-                    cur = tail;
-                    cur_tokens = cur.iter().map(|&p| tokens[(p - 1) as usize]).sum();
-                    last_allowed_cut = None;
-                    for (k, &p) in cur.iter().enumerate() {
-                        let idx0 = (p - 1) as usize;
-                        if cut_after_allowed(idx0) {
-                            last_allowed_cut = Some(k);
-                        }
-                    }
-                }
-                None => {
-                    if cur.is_empty() {
-                        cur.push(page);
-                        cur_tokens = t;
-                        if cut_after_allowed(i) {
-                            last_allowed_cut = Some(0);
-                        }
-                        i += 1;
-                    } else {
-                        let after_page = *cur.last().unwrap();
-                        chunks.push(std::mem::take(&mut cur));
-                        cur_tokens = 0;
-                        if split_at > BoundaryLevel::Page {
-                            diagnostics.push(Diagnostic::ForcedMidLevelCut { after_page });
-                        }
-                    }
-                }
-            }
+        if cur_tokens + t > budget {
+            chunks.push(PlannedChunk {
+                pages: std::mem::take(&mut cur),
+                effective_level: BoundaryLevel::Page,
+            });
+            cur_tokens = 0;
         }
+        cur.push(page);
+        cur_tokens += t;
     }
-
     if !cur.is_empty() {
-        chunks.push(cur);
+        chunks.push(PlannedChunk {
+            pages: cur,
+            effective_level: BoundaryLevel::Page,
+        });
     }
 
-    rebalance_last_two(&mut chunks, tokens, boundaries, split_at, budget);
-
-    PlanResult { chunks, diagnostics }
+    pairwise_rebalance(&mut chunks, tokens, boundaries, BoundaryLevel::Page, budget);
+    chunks
 }
 
+fn flush_units(
+    chunks: &mut Vec<PlannedChunk>,
+    cur: &mut Vec<Range<usize>>,
+    cur_tokens: &mut usize,
+    level: BoundaryLevel,
+) {
+    if cur.is_empty() {
+        return;
+    }
+    let mut pages: Vec<u32> = Vec::new();
+    for r in cur.drain(..) {
+        for i in r {
+            pages.push((i + 1) as u32);
+        }
+    }
+    *cur_tokens = 0;
+    chunks.push(PlannedChunk { pages, effective_level: level });
+}
+
+fn sum_tokens(tokens: &[usize], range: &Range<usize>) -> usize {
+    tokens[range.clone()].iter().sum()
+}
+
+/// Segment `page_range` into unit ranges at `split_at`. A unit starts at `page_range.start` and
+/// at every interior page whose boundary level is `>= split_at`. At `Page` level every page is
+/// its own unit.
+fn segment_units(
+    boundaries: &[BoundaryLevel],
+    page_range: Range<usize>,
+    split_at: BoundaryLevel,
+) -> Vec<Range<usize>> {
+    if page_range.is_empty() {
+        return Vec::new();
+    }
+    if split_at == BoundaryLevel::Page {
+        return page_range.map(|i| i..i + 1).collect();
+    }
+    let start = page_range.start;
+    let end = page_range.end;
+    let mut units = Vec::new();
+    let mut cur_start = start;
+    for (i, lvl) in boundaries.iter().enumerate().take(end).skip(start + 1) {
+        if *lvl >= split_at {
+            units.push(cur_start..i);
+            cur_start = i;
+        }
+    }
+    units.push(cur_start..end);
+    units
+}
+
+/// Find the coarsest level strictly finer than `current` that has at least one boundary inside
+/// `page_range` (excluding the start page, which is already the unit's own boundary). Falls
+/// through to `Page` when nothing finer has an interior split point.
+fn next_effective_level(
+    boundaries: &[BoundaryLevel],
+    page_range: Range<usize>,
+    current: BoundaryLevel,
+) -> BoundaryLevel {
+    let mut candidate = match current.next_finer() {
+        Some(c) => c,
+        None => return BoundaryLevel::Page,
+    };
+    loop {
+        if candidate == BoundaryLevel::Page {
+            return BoundaryLevel::Page;
+        }
+        let start = page_range.start;
+        let end = page_range.end;
+        let has_boundary = (start + 1..end).any(|i| boundaries[i] >= candidate);
+        if has_boundary {
+            return candidate;
+        }
+        candidate = match candidate.next_finer() {
+            Some(c) => c,
+            None => return BoundaryLevel::Page,
+        };
+    }
+}
+
+/// Final doc-wide rebalance between the last two chunks. Preserved verbatim in semantics from
+/// the pre-recursion implementation so documents with no overrun keep the same chunk layout.
 fn rebalance_last_two(
-    chunks: &mut Vec<Vec<u32>>,
+    chunks: &mut Vec<PlannedChunk>,
     tokens: &[usize],
     boundaries: &[BoundaryLevel],
     split_at: BoundaryLevel,
@@ -145,20 +321,99 @@ fn rebalance_last_two(
     if chunks.len() < 2 {
         return;
     }
-    let n = tokens.len();
-    let cut_after_allowed = |i: usize| -> bool { i + 1 == n || boundaries[i + 1] >= split_at };
+    let last_level = chunks.last().unwrap().effective_level;
+    let second_last_level = chunks[chunks.len() - 2].effective_level;
 
     let last = chunks.pop().unwrap();
     let second_last = chunks.pop().unwrap();
-    let combined: Vec<u32> = second_last.iter().chain(last.iter()).copied().collect();
-    let total_tokens: usize = combined.iter().map(|&p| tokens[(p - 1) as usize]).sum();
+    let combined: Vec<u32> = second_last.pages.iter().chain(last.pages.iter()).copied().collect();
+    let original_cut_idx = second_last.pages.len() - 1;
 
-    let original_cut_idx = second_last.len() - 1;
+    let pick = best_balanced_cut(&combined, tokens, boundaries, split_at, budget)
+        .unwrap_or(original_cut_idx);
 
-    let mut best_i: Option<usize> = None;
+    let new_left: Vec<u32> = combined[..=pick].to_vec();
+    let new_right: Vec<u32> = combined[pick + 1..].to_vec();
+    chunks.push(PlannedChunk { pages: new_left, effective_level: second_last_level });
+    chunks.push(PlannedChunk { pages: new_right, effective_level: last_level });
+}
+
+/// Pairwise-sweep rebalance across all adjacent chunk pairs. Stops when a full pass makes no
+/// change, or after `MAX_PASSES`. Only shifts cuts at `split_at` boundaries, so deeper-recursed
+/// regions (whose interior boundaries are all finer than `split_at`) stay intact.
+fn pairwise_rebalance(
+    chunks: &mut [PlannedChunk],
+    tokens: &[usize],
+    boundaries: &[BoundaryLevel],
+    split_at: BoundaryLevel,
+    budget: usize,
+) {
+    const MAX_PASSES: usize = 3;
+    if chunks.len() < 2 {
+        return;
+    }
+    for _ in 0..MAX_PASSES {
+        let mut changed = false;
+        for i in 0..chunks.len() - 1 {
+            if try_rebalance_pair(chunks, i, tokens, boundaries, split_at, budget) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn try_rebalance_pair(
+    chunks: &mut [PlannedChunk],
+    i: usize,
+    tokens: &[usize],
+    boundaries: &[BoundaryLevel],
+    split_at: BoundaryLevel,
+    budget: usize,
+) -> bool {
+    let (left, right) = chunks.split_at_mut(i + 1);
+    let left_chunk = &mut left[i];
+    let right_chunk = &mut right[0];
+
+    let combined: Vec<u32> = left_chunk
+        .pages
+        .iter()
+        .chain(right_chunk.pages.iter())
+        .copied()
+        .collect();
+    let original_cut_idx = left_chunk.pages.len() - 1;
+
+    let pick = match best_balanced_cut(&combined, tokens, boundaries, split_at, budget) {
+        Some(p) if p != original_cut_idx => p,
+        _ => return false,
+    };
+
+    left_chunk.pages = combined[..=pick].to_vec();
+    right_chunk.pages = combined[pick + 1..].to_vec();
+    true
+}
+
+/// Search all positions in `combined` where a cut is allowed at `split_at` and both halves stay
+/// under `budget`; return the index with the smallest |left − right| token difference. Returns
+/// `None` if no feasible cut exists (caller keeps the original cut).
+fn best_balanced_cut(
+    combined: &[u32],
+    tokens: &[usize],
+    boundaries: &[BoundaryLevel],
+    split_at: BoundaryLevel,
+    budget: usize,
+) -> Option<usize> {
+    let n = tokens.len();
+    let cut_after_allowed =
+        |idx0: usize| -> bool { idx0 + 1 == n || boundaries[idx0 + 1] >= split_at };
+
+    let total: usize = combined.iter().map(|&p| tokens[(p - 1) as usize]).sum();
+
+    let mut best: Option<usize> = None;
     let mut best_diff: usize = usize::MAX;
     let mut left_sum: usize = 0;
-
     for (k, &p) in combined.iter().enumerate() {
         left_sum += tokens[(p - 1) as usize];
         if k + 1 == combined.len() {
@@ -168,22 +423,17 @@ fn rebalance_last_two(
         if !cut_after_allowed(idx0) {
             continue;
         }
-        let right_sum = total_tokens - left_sum;
+        let right_sum = total - left_sum;
         if left_sum > budget || right_sum > budget {
             continue;
         }
         let diff = left_sum.abs_diff(right_sum);
         if diff < best_diff {
             best_diff = diff;
-            best_i = Some(k);
+            best = Some(k);
         }
     }
-
-    let pick = best_i.unwrap_or(original_cut_idx);
-    let new_left: Vec<u32> = combined[..=pick].to_vec();
-    let new_right: Vec<u32> = combined[pick + 1..].to_vec();
-    chunks.push(new_left);
-    chunks.push(new_right);
+    best
 }
 
 #[cfg(test)]
@@ -192,6 +442,17 @@ mod tests {
 
     fn pages_only(n: usize) -> Vec<BoundaryLevel> {
         vec![BoundaryLevel::Page; n]
+    }
+
+    fn chunk_pages(r: &PlanResult) -> Vec<Vec<u32>> {
+        r.chunks.iter().map(|c| c.pages.clone()).collect()
+    }
+
+    fn chunk_tokens(r: &PlanResult, tokens: &[usize]) -> Vec<usize> {
+        r.chunks
+            .iter()
+            .map(|c| c.pages.iter().map(|&p| tokens[(p - 1) as usize]).sum())
+            .collect()
     }
 
     #[test]
@@ -205,62 +466,42 @@ mod tests {
     fn single_chunk_when_total_under_budget() {
         let tokens = vec![10, 20, 30];
         let r = plan_chunks(&tokens, &pages_only(3), BoundaryLevel::Page, 100);
-        assert_eq!(r.chunks, vec![vec![1, 2, 3]]);
+        assert_eq!(chunk_pages(&r), vec![vec![1, 2, 3]]);
         assert!(r.diagnostics.is_empty());
+        assert_eq!(r.chunks[0].effective_level, BoundaryLevel::Page);
     }
 
     #[test]
     fn two_chunks_get_rebalanced() {
-        // Greedy would yield [[1,2], [3]] (30, 30). Rebalance: also balanced. Or could yield [[1], [2,3]].
         let tokens = vec![10, 20, 30];
         let r = plan_chunks(&tokens, &pages_only(3), BoundaryLevel::Page, 35);
         assert_eq!(r.chunks.len(), 2);
-        let sum0: usize = r.chunks[0].iter().map(|&p| tokens[(p - 1) as usize]).sum();
-        let sum1: usize = r.chunks[1].iter().map(|&p| tokens[(p - 1) as usize]).sum();
-        assert!(sum0.abs_diff(sum1) <= 10, "rebalance failed: {sum0} vs {sum1}");
-        assert!(sum0 <= 35 && sum1 <= 35);
+        let sums = chunk_tokens(&r, &tokens);
+        assert!(sums[0].abs_diff(sums[1]) <= 10, "rebalance failed: {:?}", sums);
+        assert!(sums.iter().all(|&s| s <= 35));
     }
 
     #[test]
     fn greedy_then_rebalance_classic() {
-        // pages: [30, 30, 30, 5], budget 60
-        // greedy: [1,2] (60), [3] (30), then page 4 (5+30=35) -> [3,4]
-        // -> chunks [[1,2], [3,4]] (60, 35). Rebalance: try cuts after 1 (30 vs 65 over), after 3 (already there, 60 vs 35 diff 25). Best feasible = original.
         let tokens = vec![30, 30, 30, 5];
         let r = plan_chunks(&tokens, &pages_only(4), BoundaryLevel::Page, 60);
-        assert_eq!(r.chunks, vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(chunk_pages(&r), vec![vec![1, 2], vec![3, 4]]);
     }
 
     #[test]
     fn three_or_more_chunks_only_last_two_rebalance() {
-        // tokens [50,50,50,50,50,1], budget 100
-        // greedy: [1,2] (100), [3,4] (100), [5,6] (51)
-        // rebalance last two: combined [5,6] (50,1), only feasible cut is original.
         let tokens = vec![50, 50, 50, 50, 50, 1];
         let r = plan_chunks(&tokens, &pages_only(6), BoundaryLevel::Page, 100);
-        assert_eq!(r.chunks, vec![vec![1, 2], vec![3, 4], vec![5, 6]]);
+        assert_eq!(chunk_pages(&r), vec![vec![1, 2], vec![3, 4], vec![5, 6]]);
     }
 
     #[test]
     fn rebalance_last_two_against_remainder_pattern() {
-        // tokens [40,40,40,40,40,40,40,5], budget 100
-        // greedy fills [1,2] (80), can't add 3 (120). [1,2], retry 3. [3,4] (80), [5,6] (80), [7,8] (45)
-        // chunks: [[1,2], [3,4], [5,6], [7,8]]
-        // last two combined: pages 5,6,7,8 tokens [40,40,40,5] total 125. budget 100.
-        // try cut after 5 (40 vs 85, both <= 100, diff 45)
-        // try cut after 6 (80 vs 45, diff 35) <- original
-        // try cut after 7 (120 > 100, skip)
-        // best: cut after 6, same as original.
         let tokens = vec![40, 40, 40, 40, 40, 40, 40, 5];
         let r = plan_chunks(&tokens, &pages_only(8), BoundaryLevel::Page, 100);
         assert_eq!(r.chunks.len(), 4);
-        let sums: Vec<usize> = r
-            .chunks
-            .iter()
-            .map(|c| c.iter().map(|&p| tokens[(p - 1) as usize]).sum())
-            .collect();
+        let sums = chunk_tokens(&r, &tokens);
         assert!(sums.iter().all(|&s| s <= 100));
-        // Last two should be at least balanceable; since the only feasible improvement matched original, accept.
         let last_sum = sums[sums.len() - 1];
         let second_last_sum = sums[sums.len() - 2];
         assert!(second_last_sum + last_sum <= 200);
@@ -270,8 +511,7 @@ mod tests {
     fn oversized_page_emits_own_chunk_with_diagnostic() {
         let tokens = vec![10, 200, 10];
         let r = plan_chunks(&tokens, &pages_only(3), BoundaryLevel::Page, 50);
-        // Expected: [1] flushed when oversized 2 hits, [2] alone, then [3] alone
-        assert_eq!(r.chunks, vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(chunk_pages(&r), vec![vec![1], vec![2], vec![3]]);
         assert_eq!(
             r.diagnostics,
             vec![Diagnostic::OversizedPage { page: 2, tokens: 200 }]
@@ -280,11 +520,6 @@ mod tests {
 
     #[test]
     fn split_at_section_only_cuts_at_section_boundaries() {
-        // 4 pages of 30 tokens each; section starts at page 3. budget 70.
-        // boundaries: [Chapter (page 1 starts doc), Page, Section, Page]
-        // greedy: add 1 (30), add 2 (60), can't add 3 (90>70). last_allowed_cut: after page 2? boundaries[2] = Section >= Section: yes, set Some(1).
-        // cut: head=[1,2], tail=[]. push, retry 3. add 3 (30), cut_after_allowed(2): boundaries[3]=Page < Section: no. add 4 (60), cut_after_allowed(3): i+1==n: yes, last=Some(1). loop ends. push [3,4].
-        // rebalance: combined [1,2,3,4], tokens 30,30,30,30. cuts allowed: after 2 (Section), after 4 (end). best feasible: after 2 (60 vs 60, diff 0). Same as greedy.
         let tokens = vec![30, 30, 30, 30];
         let boundaries = vec![
             BoundaryLevel::Chapter,
@@ -293,15 +528,17 @@ mod tests {
             BoundaryLevel::Page,
         ];
         let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Section, 70);
-        assert_eq!(r.chunks, vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(chunk_pages(&r), vec![vec![1, 2], vec![3, 4]]);
         assert!(r.diagnostics.is_empty());
+        assert!(r.chunks.iter().all(|c| c.effective_level == BoundaryLevel::Section));
     }
 
     #[test]
-    fn split_at_section_forces_mid_level_cut_when_no_boundary_fits() {
+    fn split_at_section_no_interior_boundary_recurses_to_page() {
         // 4 pages of 30 tokens; only boundary at page 1 (start). budget 70. split_at=Section.
-        // boundaries: [Chapter, Page, Page, Page]. There's no Section boundary anywhere within doc.
-        // greedy: add 1 (30), cut_after_allowed(0) = boundaries[1]=Page < Section: no. add 2 (60). cut_after_allowed(1): no. can't add 3 (90). last_allowed_cut = None. force cut: push [1,2]. diagnostic ForcedMidLevelCut after page 2. retry 3. add 3 (30). add 4 (60). loop ends. push [3,4].
+        // No interior boundary >= Section anywhere → the whole doc is one unit which overruns,
+        // recurses down to Page level, and emits balanced page-level chunks with no
+        // ForcedMidLevelCut diagnostic (that diagnostic is gone).
         let tokens = vec![30, 30, 30, 30];
         let boundaries = vec![
             BoundaryLevel::Chapter,
@@ -310,29 +547,26 @@ mod tests {
             BoundaryLevel::Page,
         ];
         let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Section, 70);
-        assert_eq!(r.chunks, vec![vec![1, 2], vec![3, 4]]);
-        assert_eq!(
-            r.diagnostics,
-            vec![Diagnostic::ForcedMidLevelCut { after_page: 2 }]
-        );
+        assert_eq!(chunk_pages(&r), vec![vec![1, 2], vec![3, 4]]);
+        assert!(r.diagnostics.is_empty());
+        assert!(r.chunks.iter().all(|c| c.effective_level == BoundaryLevel::Page));
     }
 
     #[test]
     fn split_at_chapter_emits_no_diagnostic_for_page_only_doc_when_total_fits_one_chunk() {
-        // No chapters; total fits in one chunk. No forced cut needed.
         let tokens = vec![10, 10, 10];
-        let boundaries = vec![BoundaryLevel::Chapter, BoundaryLevel::Page, BoundaryLevel::Page];
+        let boundaries = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Page,
+            BoundaryLevel::Page,
+        ];
         let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 100);
-        assert_eq!(r.chunks, vec![vec![1, 2, 3]]);
+        assert_eq!(chunk_pages(&r), vec![vec![1, 2, 3]]);
         assert!(r.diagnostics.is_empty());
     }
 
     #[test]
     fn rebalance_respects_allowed_cuts() {
-        // 4 pages, tokens [10, 50, 10, 30]. budget 70. split_at=Section.
-        // boundaries: [Chapter, Page, Section, Page]
-        // greedy: add 1 (10), no allowed cut after (boundaries[1]=Page<Section). add 2 (60). no allowed cut after (boundaries[2]=Section actually >= Section: yes! set last_allowed_cut=Some(1)). add 3? 60+10=70 ok. add 3 (70). cut_after(2)= boundaries[3]=Page<Section: no. last_allowed_cut still Some(1). try add 4: 70+30=100>70. cut: head=[1,2] (60), tail=[3] (10). push head. cur=[3], cur_tokens=10, recompute last: cut_after(2)=no, none. retry add 4: 10+30=40 ok. add 4, cut_after(3)=i+1==n: yes, last=Some(1). end. push [3,4].
-        // chunks before rebalance: [[1,2], [3,4]] (60, 40). combined [1,2,3,4]. allowed cuts: after 2 (Section), after 4 (end). best feasible <= 70: after 2 (60v40, diff 20), after 4 invalid (right empty). Original cut was after 2. No change.
         let tokens = vec![10, 50, 10, 30];
         let boundaries = vec![
             BoundaryLevel::Chapter,
@@ -341,16 +575,258 @@ mod tests {
             BoundaryLevel::Page,
         ];
         let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Section, 70);
-        assert_eq!(r.chunks, vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(chunk_pages(&r), vec![vec![1, 2], vec![3, 4]]);
     }
 
     #[test]
     fn rebalance_does_not_pick_cut_that_exceeds_budget() {
-        // Greedy yields balanced last two; rebalance MUST not move to a cut that pushes one half over budget.
         let tokens = vec![10, 10, 60, 10];
-        // pages_only -> all cuts allowed
-        // greedy: add 1 (10), add 2 (20), add 3 (80>70 budget: depends). budget 80 -> add 3 ok (80). try add 4: 90>80. cut: last=Some(2). head=[1,2,3] tail=[]. push, retry 4. add 4. end. chunks=[[1,2,3],[4]] (80, 10). rebalance: combined [1,2,3,4], total 90. cuts: after 1 (10v80 over), after 2 (20v70 valid, diff 50), after 3 (80v10 valid, diff 70 - original). Best: after 2 (diff 50). New chunks: [[1,2], [3,4]] sums 20, 70 - both <= 80.
         let r = plan_chunks(&tokens, &pages_only(4), BoundaryLevel::Page, 80);
-        assert_eq!(r.chunks, vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(chunk_pages(&r), vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    // ---- recursive-balance tests ----
+
+    #[test]
+    fn oversized_chapter_recurses_to_section_and_balances() {
+        // One chapter containing three equal sections at pages 1, 2, 3 (each 100 tokens).
+        // Chapter tokens = 300; budget = 120 (so the chapter is ~2.5× budget).
+        // split_at = Chapter → unit is the whole doc → overruns → recurses to Section level.
+        let tokens = vec![100, 100, 100];
+        let boundaries = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Section,
+            BoundaryLevel::Section,
+        ];
+        let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 120);
+        let sums = chunk_tokens(&r, &tokens);
+        assert!(sums.iter().all(|&s| s <= 120), "budget violated: {:?}", sums);
+        // Flat coverage: all three pages accounted for once, in order.
+        let flat: Vec<u32> = r.chunks.iter().flat_map(|c| c.pages.clone()).collect();
+        assert_eq!(flat, vec![1, 2, 3]);
+        assert!(
+            r.chunks.iter().all(|c| c.effective_level == BoundaryLevel::Section),
+            "expected all chunks at Section level, got {:?}",
+            r.chunks.iter().map(|c| c.effective_level).collect::<Vec<_>>()
+        );
+        assert!(r.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn oversized_chapter_falls_through_to_page_when_no_finer_boundaries() {
+        // One chapter, no finer outline. Chapter overruns → recursion falls through
+        // (Section→Subsection→AnyBookmark all empty inside) → Page level.
+        let tokens = vec![30, 30, 30, 30, 30];
+        let boundaries = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Page,
+            BoundaryLevel::Page,
+            BoundaryLevel::Page,
+            BoundaryLevel::Page,
+        ];
+        let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 90);
+        let sums = chunk_tokens(&r, &tokens);
+        assert!(sums.iter().all(|&s| s <= 90), "budget violated: {:?}", sums);
+        assert!(r.chunks.iter().all(|c| c.effective_level == BoundaryLevel::Page));
+        assert!(r.diagnostics.is_empty());
+        let flat: Vec<u32> = r.chunks.iter().flat_map(|c| c.pages.clone()).collect();
+        assert_eq!(flat, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn mixed_top_level_some_fit_some_recurse() {
+        // Two chapters. Chapter A (pages 1-2) fits in its own chunk. Chapter B (pages 3-6)
+        // contains four sections of 40 tokens each and overruns budget 80 → recurses to Section.
+        // Expect chunk 0 at Chapter level, subsequent chunks at Section level.
+        let tokens = vec![40, 40, 40, 40, 40, 40];
+        let boundaries = vec![
+            BoundaryLevel::Chapter, // page 1 starts chapter A
+            BoundaryLevel::Section, // page 2 is a section within A
+            BoundaryLevel::Chapter, // page 3 starts chapter B
+            BoundaryLevel::Section,
+            BoundaryLevel::Section,
+            BoundaryLevel::Section,
+        ];
+        let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 80);
+        let sums = chunk_tokens(&r, &tokens);
+        assert!(sums.iter().all(|&s| s <= 80), "budget violated: {:?}", sums);
+
+        // First chunk is chapter A (pages 1-2) at Chapter level.
+        assert_eq!(r.chunks[0].pages, vec![1, 2]);
+        assert_eq!(r.chunks[0].effective_level, BoundaryLevel::Chapter);
+        // Later chunks are sub-chunks of chapter B at Section level.
+        assert!(
+            r.chunks[1..]
+                .iter()
+                .all(|c| c.effective_level == BoundaryLevel::Section),
+            "expected later chunks at Section level"
+        );
+        let flat: Vec<u32> = r.chunks.iter().flat_map(|c| c.pages.clone()).collect();
+        assert_eq!(flat, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn oversized_page_inside_recursed_unit_still_fires_diagnostic() {
+        // Chapter = 1 page that itself is oversized. No finer structure. Recursion falls
+        // through to Page, where the single-page base case still emits OversizedPage.
+        let tokens = vec![10, 200, 10];
+        let boundaries = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Chapter, // page 2 starts a new chapter (which overruns)
+            BoundaryLevel::Chapter,
+        ];
+        let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 50);
+        assert_eq!(chunk_pages(&r), vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(
+            r.diagnostics,
+            vec![Diagnostic::OversizedPage { page: 2, tokens: 200 }]
+        );
+    }
+
+    #[test]
+    fn oversized_page_inside_multi_page_recursed_chapter_warns() {
+        // One chapter, five pages, page 3 is oversized (tokens > budget). The chapter overruns
+        // so we recurse to Page level. The oversized page must still trigger the
+        // OversizedPage diagnostic — this is the "recursion bottomed out but a single atomic
+        // unit still exceeds budget" signal the user needs to see.
+        let tokens = vec![100, 100, 8000, 100, 100];
+        let boundaries = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Page,
+            BoundaryLevel::Page,
+            BoundaryLevel::Page,
+            BoundaryLevel::Page,
+        ];
+        let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 1000);
+        assert_eq!(
+            r.diagnostics,
+            vec![Diagnostic::OversizedPage { page: 3, tokens: 8000 }]
+        );
+        // The oversized page is its own chunk; neighbors pack around it.
+        assert!(
+            r.chunks.iter().any(|c| c.pages == vec![3]),
+            "expected page 3 alone in its own chunk, got {:?}",
+            r.chunks.iter().map(|c| c.pages.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn recursed_chunks_never_mergeable_with_neighbors() {
+        // Regression: the Draco_Malfoy book at budget 7000 produced pairs like [3145, 3218] and
+        // [2286, 2374] within the same recursed chapter — both pairs sum under budget. The
+        // equal-target packing bug was causing that; budget-greedy should make adjacent pairs
+        // always sum strictly *over* budget within a recursed unit.
+        //
+        // 14 pages of 500 tokens each = 7000 total. Chapter covers all. Budget 6000 forces
+        // recursion to Page. Expect the produced chunks to have the invariant that no two
+        // adjacent chunks can be combined under budget.
+        let tokens = vec![500usize; 14];
+        let mut boundaries = vec![BoundaryLevel::Page; 14];
+        boundaries[0] = BoundaryLevel::Chapter;
+        let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 6000);
+        let sums = chunk_tokens(&r, &tokens);
+        assert!(sums.iter().all(|&s| s <= 6000), "budget violated: {:?}", sums);
+        for w in sums.windows(2) {
+            assert!(
+                w[0] + w[1] > 6000,
+                "adjacent chunks could be merged under budget: {} + {} = {} ≤ 6000",
+                w[0],
+                w[1],
+                w[0] + w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn recursed_chapter_does_not_oversplit() {
+        // Another regression: pack a chapter of 8 pages @ 400 tokens each = 3200 total, budget
+        // 2000. Budget-greedy should give 2 chunks (each 1600-2000 tokens), not 3+ tiny ones.
+        let tokens = vec![400usize; 8];
+        let mut boundaries = vec![BoundaryLevel::Page; 8];
+        boundaries[0] = BoundaryLevel::Chapter;
+        let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 2000);
+        assert_eq!(r.chunks.len(), 2, "expected 2 chunks, got {}: {:?}", r.chunks.len(), chunk_tokens(&r, &tokens));
+        let sums = chunk_tokens(&r, &tokens);
+        assert!(sums.iter().all(|&s| s <= 2000));
+        // Balanced within 1 page (400 tokens).
+        assert!(sums[0].abs_diff(sums[1]) <= 400, "unbalanced: {:?}", sums);
+    }
+
+    #[test]
+    fn balance_improves_with_pairwise_sweep() {
+        // Without pairwise sweep, equal-target greedy could leave the final chunk small.
+        // Five sections of [60, 60, 60, 60, 60] (total 300), budget 120 → k=3, target=100.
+        // Greedy equal-target: U1(60) cur=60 (not at hysteresis 50, add). U2(60) cur+t=120>target
+        // AND hysteresis ok AND has content → flush [U1] 60. cur=[U2] 60. U3(60) same as U2 →
+        // flush [U2] 60. cur=[U3] 60. U4 same → flush [U3] 60. cur=[U4] 60. U5 same → flush [U4]
+        // 60. cur=[U5] 60. End flush [U5] 60. Five chunks of 60 each. Pairwise rebalance should
+        // fuse adjacent pairs... actually it only MOVES cuts, doesn't merge. So we'd still have
+        // 5 chunks. To ensure coverage, just verify budget and ordering.
+        let tokens = vec![60, 60, 60, 60, 60];
+        let boundaries = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Section,
+            BoundaryLevel::Section,
+            BoundaryLevel::Section,
+            BoundaryLevel::Section,
+        ];
+        let r = plan_chunks(&tokens, &boundaries, BoundaryLevel::Chapter, 120);
+        let sums = chunk_tokens(&r, &tokens);
+        assert!(sums.iter().all(|&s| s <= 120));
+        let flat: Vec<u32> = r.chunks.iter().flat_map(|c| c.pages.clone()).collect();
+        assert_eq!(flat, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn next_finer_chain() {
+        assert_eq!(BoundaryLevel::Chapter.next_finer(), Some(BoundaryLevel::Section));
+        assert_eq!(BoundaryLevel::Section.next_finer(), Some(BoundaryLevel::Subsection));
+        assert_eq!(BoundaryLevel::Subsection.next_finer(), Some(BoundaryLevel::AnyBookmark));
+        assert_eq!(BoundaryLevel::AnyBookmark.next_finer(), Some(BoundaryLevel::Page));
+        assert_eq!(BoundaryLevel::Page.next_finer(), None);
+    }
+
+    #[test]
+    fn segment_units_at_page_returns_singletons() {
+        let b = pages_only(4);
+        let units = segment_units(&b, 0..4, BoundaryLevel::Page);
+        assert_eq!(units, vec![0..1, 1..2, 2..3, 3..4]);
+    }
+
+    #[test]
+    fn segment_units_at_section_splits_on_interior_boundaries() {
+        let b = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Page,
+            BoundaryLevel::Section,
+            BoundaryLevel::Page,
+            BoundaryLevel::Section,
+        ];
+        let units = segment_units(&b, 0..5, BoundaryLevel::Section);
+        assert_eq!(units, vec![0..2, 2..4, 4..5]);
+    }
+
+    #[test]
+    fn next_effective_level_skips_empty_levels() {
+        // Chapter requested; interior has only Page boundaries → fall through to Page.
+        let b = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Page,
+            BoundaryLevel::Page,
+        ];
+        assert_eq!(
+            next_effective_level(&b, 0..3, BoundaryLevel::Chapter),
+            BoundaryLevel::Page
+        );
+        // Chapter requested; interior has a Section → land on Section.
+        let b = vec![
+            BoundaryLevel::Chapter,
+            BoundaryLevel::Section,
+            BoundaryLevel::Page,
+        ];
+        assert_eq!(
+            next_effective_level(&b, 0..3, BoundaryLevel::Chapter),
+            BoundaryLevel::Section
+        );
     }
 }

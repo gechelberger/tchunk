@@ -34,6 +34,7 @@ pub struct ChunkEntry {
     pub filename: String,
     pub pages: Pages,
     pub token_count: usize,
+    pub effective_level: &'static str,
 }
 
 #[derive(Serialize)]
@@ -52,9 +53,6 @@ pub enum Warning {
     OversizedPage {
         page: u32,
         tokens: usize,
-    },
-    ForcedMidLevelCut {
-        after_page: u32,
     },
     ScanLike {
         near_empty_pages: usize,
@@ -109,6 +107,7 @@ mod tests {
                 filename: "book_001.pdf".to_string(),
                 pages: Pages { start: 1, end: 10, count: 10 },
                 token_count: 1234,
+                effective_level: "page",
             }],
             warnings: vec![],
         };
