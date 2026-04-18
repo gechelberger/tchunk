@@ -94,17 +94,19 @@ fn run(cli: Cli) -> Result<(), RunError> {
     let images_elapsed = t_images.elapsed();
 
     let mut warnings: Vec<Warning> = Vec::new();
-    warnings.extend(emit_content_warnings(&cli.input, &tokens, &images));
+    warnings.extend(emit_content_warnings(&cli.input, &tokens, &images, cli.quiet));
 
     let requested_split_at: BoundaryLevel = cli.split_at.into();
     let mut split_at = requested_split_at;
     let mut boundaries = pdf.boundaries();
 
     if split_at > BoundaryLevel::Page && !pdf.has_outline() {
-        eprintln!(
-            "warning: no outline present in PDF; --split-at {:?} ignored, falling back to page.",
-            cli.split_at
-        );
+        if !cli.quiet {
+            eprintln!(
+                "warning: no outline present in PDF; --split-at {:?} ignored, falling back to page.",
+                cli.split_at
+            );
+        }
         warnings.push(Warning::OutlineMissing {
             requested: index::boundary_level_str(requested_split_at),
         });
@@ -117,16 +119,20 @@ fn run(cli: Cli) -> Result<(), RunError> {
     for diag in &plan.diagnostics {
         match diag {
             Diagnostic::OversizedPage { page, tokens: t } => {
-                eprintln!(
-                    "warning: page {page} has {t} tokens, which exceeds --max-tokens {}; emitted as its own chunk.",
-                    cli.max_tokens
-                );
+                if !cli.quiet {
+                    eprintln!(
+                        "warning: page {page} has {t} tokens, which exceeds --max-tokens {}; emitted as its own chunk.",
+                        cli.max_tokens
+                    );
+                }
                 warnings.push(Warning::OversizedPage { page: *page, tokens: *t });
             }
             Diagnostic::ForcedMidLevelCut { after_page } => {
-                eprintln!(
-                    "warning: forced page-level cut after page {after_page} — no allowed cut at --split-at level was reachable within budget."
-                );
+                if !cli.quiet {
+                    eprintln!(
+                        "warning: forced page-level cut after page {after_page} — no allowed cut at --split-at level was reachable within budget."
+                    );
+                }
                 warnings.push(Warning::ForcedMidLevelCut { after_page: *after_page });
             }
         }
@@ -304,6 +310,7 @@ fn emit_content_warnings(
     input: &std::path::Path,
     tokens: &[usize],
     images: &[usize],
+    quiet: bool,
 ) -> Vec<Warning> {
     let mut out = Vec::new();
     let total_pages = tokens.len();
@@ -315,15 +322,17 @@ fn emit_content_warnings(
         .filter(|&&t| t < SCAN_LIKE_TOKEN_THRESHOLD)
         .count();
     if near_empty * 100 / total_pages >= SCAN_LIKE_PAGE_RATIO_PCT {
-        eprintln!(
-            "warning: {} appears to be scanned/image-based ({}/{} pages have almost no extractable text). \
-             Token-based splitting will not reflect actual content size. Consider running the PDF through \
-             an OCR tool such as ocrmypdf (https://github.com/ocrmypdf/OCRmyPDF) first — it adds a \
-             searchable text layer while preserving the original images.",
-            input.display(),
-            near_empty,
-            total_pages
-        );
+        if !quiet {
+            eprintln!(
+                "warning: {} appears to be scanned/image-based ({}/{} pages have almost no extractable text). \
+                 Token-based splitting will not reflect actual content size. Consider running the PDF through \
+                 an OCR tool such as ocrmypdf (https://github.com/ocrmypdf/OCRmyPDF) first — it adds a \
+                 searchable text layer while preserving the original images.",
+                input.display(),
+                near_empty,
+                total_pages
+            );
+        }
         out.push(Warning::ScanLike {
             near_empty_pages: near_empty,
             total_pages,
@@ -337,11 +346,13 @@ fn emit_content_warnings(
         .filter(|(&t, &n)| n >= 1 && t < IMAGE_DOMINANT_TOKEN_THRESHOLD)
         .count();
     if image_dominant > 0 {
-        eprintln!(
-            "warning: {} of {} pages contain significant non-text content (images/figures). \
-             Token counts underestimate their size; downstream tools may handle them differently.",
-            image_dominant, total_pages
-        );
+        if !quiet {
+            eprintln!(
+                "warning: {} of {} pages contain significant non-text content (images/figures). \
+                 Token counts underestimate their size; downstream tools may handle them differently.",
+                image_dominant, total_pages
+            );
+        }
         out.push(Warning::ImageDominant {
             pages_affected: image_dominant,
             total_pages,

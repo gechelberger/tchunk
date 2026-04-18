@@ -79,8 +79,13 @@ pub struct Cli {
     pub tokenizer: TokenizerKind,
 
     /// Print per-chunk page ranges and token totals to stderr.
-    #[arg(short = 'v', long)]
+    #[arg(short = 'v', long, conflicts_with = "quiet")]
     pub verbose: bool,
+
+    /// Suppress warnings to stderr. Hard errors are still printed. Warnings remain
+    /// recorded in the index sidecar.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 
     /// Worker threads for per-page extract/tokenize/image-scan. `1` = sequential; `0` =
     /// auto-detect (use all available cores). Chunk writing stays sequential.

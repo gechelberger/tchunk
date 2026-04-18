@@ -49,6 +49,7 @@ tchunk-pdf my-book.pdf -v
 | `-p`  | `--prefix`       | input stem    | Output filename prefix. |
 | `-t`  | `--tokenizer`    | `cl100k_base` | `cl100k_base` or `o200k_base`, or `word_count` |
 | `-v`  | `--verbose`      | off           | Print per-chunk page ranges and token totals to stderr. |
+| `-q`  | `--quiet`        | off           | Suppress warnings on stderr. Errors still print; warnings remain in the index sidecar. |
 | `-j`  | `--jobs`         | `1`           | N threads for extract/tokenize/image-scan. `1` sequential, `0` auto-detect. |
 
 ## Output
@@ -111,7 +112,7 @@ Per-page text is extracted via `lopdf::Document::extract_text`, which is fast bu
 
 ## Warnings
 
-To stderr (always; no `--quiet` flag yet):
+To stderr (suppressible with `-q/--quiet`; structured copies are always recorded in the index sidecar):
 
 - **Scan-like PDF** — ≥50% of pages have <20 extractable tokens. Strong signal the PDF is image-only / unsearchable. Token-based splitting won't reflect actual content size; OCR preprocessing recommended (see below).
 - **Image-dominant pages** — pages with at least one embedded image and <50 tokens of text. Token counts underestimate their effective size; downstream tools may treat them differently.
@@ -153,13 +154,12 @@ Benchmark: [USCODE-2011-title26.pdf](https://www.govinfo.gov/content/pkg/USCODE-
 
 ## Limitations / deferred
 
-- **No overlap window between chunks.** When chunks are fed to a downstream LLM directly (RAG pipelines, do-it-yourself retrieval), it's common to have each chunk's start repeat the last few pages of the previous chunk so that passages spanning the cut are fully contained in at least one chunk. Not currently implemented because tchunk-pdf's primary target — NotebookLM and similar — does its own internal chunking and embedding over the source it's given, so a tchunk-pdf-level overlap would mostly add cost without changing what the downstream tool sees. If a use case shows up where outputs are consumed directly by an LLM context window, this is the right thing to add.
+- **No overlap window between chunks.** When chunks are fed to a downstream LLM directly (RAG pipelines, do-it-yourself retrieval), it's common to have each chunk's start repeat the last few pages of the previous chunk so that passages spanning the cut are fully contained in at least one chunk.
 - Rebalancing midsection cuts may not work as desired (planned).
 - No font-size-based heading detection for PDFs without an outline.
 - No OCR (use `ocrmypdf` upstream).
 - Encrypted PDFs are not supported.
 - No streaming `stdin` input or multi-file input.
-- No `--quiet` flag to suppress warnings.
 
 ## License
 
