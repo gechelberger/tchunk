@@ -8,38 +8,35 @@ use lopdf::{Destination, Document, Object, ObjectId, Outline};
 use crate::plan::BoundaryLevel;
 
 pub struct Pdf {
-    bytes: Vec<u8>,
     doc: Document,
     pages: BTreeMap<u32, ObjectId>,
 }
 
 impl Pdf {
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read input file: {}", path.display()))?;
-        let doc = Document::load_mem(&bytes)
+        let doc = Document::load(path)
             .with_context(|| format!("failed to parse PDF: {}", path.display()))?;
         let pages = doc.get_pages();
-        Ok(Self { bytes, doc, pages })
+        Ok(Self { doc, pages })
     }
 
     pub fn page_count(&self) -> usize {
         self.pages.len()
     }
 
-    /// Per-page text via `pdf-extract`. Returns one String per page (length == page_count).
-    /// On failure, returns empty strings for all pages so token counting still proceeds (with
-    /// zero-token pages, which will trigger the scan-like warning naturally).
+    /// Per-page text. Returns one String per page (length == page_count).
+    ///
+    /// Uses `lopdf::Document::extract_text` on the already-parsed Document (no second PDF parse),
+    /// which is much faster than `pdf-extract` on large files. Quality is lower than pdf-extract,
+    /// but we only use this for token *counting* — approximate is fine. Per-page failures yield
+    /// empty strings (will look like a near-empty page to the scan-like warning).
     pub fn page_texts(&self) -> Vec<String> {
-        match pdf_extract::extract_text_from_mem_by_pages(&self.bytes) {
-            Ok(v) if v.len() == self.pages.len() => v,
-            Ok(v) => {
-                let mut out = v;
-                out.resize(self.pages.len(), String::new());
-                out
-            }
-            Err(_) => vec![String::new(); self.pages.len()],
+        let mut out = Vec::with_capacity(self.pages.len());
+        for &page_num in self.pages.keys() {
+            let text = self.doc.extract_text(&[page_num]).unwrap_or_default();
+            out.push(text);
         }
+        out
     }
 
     /// Number of `/Subtype /Image` XObjects referenced by each page (1-based indexed).
