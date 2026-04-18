@@ -36,3 +36,75 @@ impl Tokenizer for TiktokenTokenizer {
         self.name
     }
 }
+
+pub struct WordCountTokenizer;
+
+impl Tokenizer for WordCountTokenizer {
+    fn count(&self, text: &str) -> usize {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .count()
+    }
+
+    fn name(&self) -> &str {
+        "word_count"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_count_empty() {
+        assert_eq!(WordCountTokenizer.count(""), 0);
+    }
+
+    #[test]
+    fn word_count_whitespace_only() {
+        assert_eq!(WordCountTokenizer.count("   \t\n  "), 0);
+    }
+
+    #[test]
+    fn word_count_punctuation_only() {
+        assert_eq!(WordCountTokenizer.count("!!! --- ,,,"), 0);
+    }
+
+    #[test]
+    fn word_count_plain_words() {
+        assert_eq!(WordCountTokenizer.count("the quick brown fox"), 4);
+    }
+
+    #[test]
+    fn word_count_punctuation_between_words() {
+        assert_eq!(WordCountTokenizer.count("hello,world"), 2);
+    }
+
+    #[test]
+    fn word_count_leading_and_trailing_punctuation() {
+        assert_eq!(WordCountTokenizer.count("...hello, world!"), 2);
+    }
+
+    #[test]
+    fn word_count_collapses_runs_of_whitespace_and_punctuation() {
+        assert_eq!(WordCountTokenizer.count("one  ,  two -- three"), 3);
+    }
+
+    #[test]
+    fn word_count_numbers_are_words() {
+        assert_eq!(WordCountTokenizer.count("page 42 of 100"), 4);
+    }
+
+    #[test]
+    fn word_count_apostrophe_splits_contractions() {
+        // "don't" has an apostrophe, which is non-alphanumeric, so it splits
+        // into "don" + "t". Pinning this down: the tokenizer is intentionally
+        // naive and doesn't special-case apostrophes.
+        assert_eq!(WordCountTokenizer.count("don't"), 2);
+    }
+
+    #[test]
+    fn word_count_name_is_word_count() {
+        assert_eq!(WordCountTokenizer.name(), "word_count");
+    }
+}

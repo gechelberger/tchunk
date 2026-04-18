@@ -47,9 +47,9 @@ tchunk-pdf my-book.pdf -v
 | `-s`  | `--split-at`     | `page`        | Coarsest level a split is allowed at: `page`, `any-bookmark`, `subsection`, `section`, `chapter`. |
 | `-o`  | `--output-dir`   | `.`           | Output directory (created if missing). |
 | `-p`  | `--prefix`       | input stem    | Output filename prefix. |
-| `-t`  | `--tokenizer`    | `cl100k_base` | `cl100k_base` or `o200k_base` (tiktoken BPE). |
+| `-t`  | `--tokenizer`    | `cl100k_base` | `cl100k_base` or `o200k_base`, or `word_count` |
 | `-v`  | `--verbose`      | off           | Print per-chunk page ranges and token totals to stderr. |
-| `-j`  | `--jobs`         | `1`           | Per-page worker threads for extract/tokenize/image-scan. `1` sequential, `0` auto-detect. |
+| `-j`  | `--jobs`         | `1`           | N threads for extract/tokenize/image-scan. `1` sequential, `0` auto-detect. |
 
 ## Output
 
@@ -72,9 +72,15 @@ Single-chunk runs still get the `_001` suffix — no special case for "did it sp
 - **Mid-section overruns.** If the budget would be exceeded with no allowed structural cut available, tchunk-pdf emits a page-level cut anyway (staying under budget) and warns.
 - **Oversized pages.** A single page whose token count exceeds `--max-tokens` becomes its own output chunk with a warning.
 
-## Token counting
+## Tokenizers
 
-Tokens are counted with `tiktoken-rs` (`cl100k_base` by default; `o200k_base` available). NotebookLM doesn't publish its tokenizer, so this is a generic LLM-token proxy — close enough for sizing, not exact.
+Three options, selected with `-t/--tokenizer`:
+
+- **`cl100k_base`** (default) — tiktoken BPE used by GPT-3.5/4 and many other LLMs. Good general-purpose proxy for LLM token counts.
+- **`o200k_base`** — tiktoken BPE used by GPT-4o and newer OpenAI models.
+- **`word_count`** — whitespace-split word count with non-alphanumeric chars treated as word boundaries (so `"hello,world"` is 2, `"don't"` is 2). Simple and fast, no model data loaded. Useful when you want "words per chunk" as the budget unit rather than LLM tokens.
+
+NotebookLM doesn't publish its tokenizer, so the BPE options are generic LLM-token proxies — close enough for sizing, not exact.
 
 Per-page text is extracted via `lopdf::Document::extract_text`, which is fast but lower fidelity than dedicated extractors. For our purposes — *counting* tokens to size chunks — approximate is fine; a few percent off doesn't change which side of the budget a chunk lands on.
 

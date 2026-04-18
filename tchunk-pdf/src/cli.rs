@@ -32,6 +32,8 @@ pub enum TokenizerKind {
     Cl100kBase,
     #[value(name = "o200k_base")]
     O200kBase,
+    #[value(name = "word_count")]
+    WordCount,
 }
 
 impl TokenizerKind {
@@ -39,6 +41,7 @@ impl TokenizerKind {
         match self {
             TokenizerKind::Cl100kBase => "cl100k_base",
             TokenizerKind::O200kBase => "o200k_base",
+            TokenizerKind::WordCount => "word_count",
         }
     }
 }

@@ -7,10 +7,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use rayon::ThreadPool;
 
-use tchunk_pdf::cli::Cli;
+use tchunk_pdf::cli::{Cli, TokenizerKind};
 use tchunk_pdf::pdf::Pdf;
 use tchunk_pdf::plan::{plan_chunks, BoundaryLevel, Diagnostic};
-use tchunk_pdf::tokenize::{TiktokenTokenizer, Tokenizer};
+use tchunk_pdf::tokenize::{TiktokenTokenizer, Tokenizer, WordCountTokenizer};
 
 const SCAN_LIKE_TOKEN_THRESHOLD: usize = 20;
 const SCAN_LIKE_PAGE_RATIO_PCT: usize = 50;
@@ -49,7 +49,10 @@ fn run(cli: Cli) -> Result<(), RunError> {
         )));
     }
 
-    let tokenizer = TiktokenTokenizer::new(cli.tokenizer.as_str()).map_err(RunError::Input)?;
+    let tokenizer: Box<dyn Tokenizer + Send + Sync> = match cli.tokenizer {
+        TokenizerKind::WordCount => Box::new(WordCountTokenizer),
+        other => Box::new(TiktokenTokenizer::new(other.as_str()).map_err(RunError::Input)?),
+    };
 
     let pool = build_pool(cli.jobs).map_err(RunError::Input)?;
     let page_nums = pdf.page_nums();
