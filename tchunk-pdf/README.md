@@ -63,6 +63,31 @@ my-book_003.pdf
 
 Single-chunk runs still get the `_001` suffix — no special case for "did it split?". Existing files at the target paths are overwritten without prompting.
 
+### Index sidecar
+
+Alongside the PDFs, a JSON sidecar is written at `{prefix}.index.json` describing the run: source file, config, per-chunk page ranges and token counts, and any structured warnings that were raised. Intended for downstream tooling that needs to know what's inside each chunk without re-parsing the PDFs.
+
+```json
+{
+  "tool": "tchunk-pdf",
+  "version": "0.1.0",
+  "source": { "path": "my-book.pdf", "page_count": 320 },
+  "config": {
+    "tokenizer": "cl100k_base",
+    "max_tokens": 500000,
+    "split_at_requested": "chapter",
+    "split_at_effective": "chapter"
+  },
+  "chunks": [
+    { "filename": "my-book_001.pdf", "pages": { "start": 1, "end": 112, "count": 112 }, "token_count": 487234 },
+    { "filename": "my-book_002.pdf", "pages": { "start": 113, "end": 320, "count": 208 }, "token_count": 412118 }
+  ],
+  "warnings": []
+}
+```
+
+Warning entries are tagged objects: `scan_like`, `image_dominant`, `outline_missing`, `oversized_page`, `forced_mid_level_cut`. The same warnings are still printed to stderr; the sidecar just makes them machine-readable.
+
 ## Splitting behavior
 
 - **Page is atomic.** A page is never split mid-page; chunks are always whole-page subsets.
@@ -129,7 +154,6 @@ Benchmark: [USCODE-2011-title26.pdf](https://www.govinfo.gov/content/pkg/USCODE-
 ## Limitations / deferred
 
 - No overlap window between chunks (planned for a later release).
-- No `index.json` sidecar with per-chunk metadata (planned).
 - Rebalancing midsection cuts may not work as desired (planned).
 - No font-size-based heading detection for PDFs without an outline.
 - No OCR (use `ocrmypdf` upstream).

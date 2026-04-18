@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
@@ -146,4 +147,58 @@ fn single_chunk_when_budget_exceeds_total() {
     pdf.write_chunk(&plan.chunks[0], &out_path).unwrap();
     let reloaded = Pdf::load(&out_path).unwrap();
     assert_eq!(reloaded.page_count(), 3);
+}
+
+#[test]
+fn cli_writes_index_sidecar_with_chunk_entries() {
+    let bytes = synthesize_pdf(6);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-index-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("smoke.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let out_dir = dir.join("out");
+    let bin = env!("CARGO_BIN_EXE_tchunk-pdf");
+    let status = Command::new(bin)
+        .arg(&input_path)
+        .arg("-m")
+        .arg("10")
+        .arg("-o")
+        .arg(&out_dir)
+        .arg("-t")
+        .arg("word_count")
+        .status()
+        .expect("spawn tchunk-pdf");
+    assert!(status.success(), "binary exited non-zero: {status:?}");
+
+    let index_path = out_dir.join("smoke.index.json");
+    let json_text = std::fs::read_to_string(&index_path)
+        .unwrap_or_else(|e| panic!("sidecar missing at {}: {e}", index_path.display()));
+    let v: serde_json::Value = serde_json::from_str(&json_text).expect("valid JSON");
+
+    assert_eq!(v["tool"], "tchunk-pdf");
+    assert_eq!(v["source"]["page_count"], 6);
+    assert_eq!(v["config"]["tokenizer"], "word_count");
+    assert_eq!(v["config"]["max_tokens"], 10);
+    assert_eq!(v["config"]["split_at_requested"], "page");
+    assert_eq!(v["config"]["split_at_effective"], "page");
+
+    let chunks = v["chunks"].as_array().expect("chunks array");
+    assert!(!chunks.is_empty());
+
+    // Chunks must cover pages 1..=6 contiguously with no gaps/overlap.
+    let mut expected_next: u64 = 1;
+    for c in chunks {
+        let start = c["pages"]["start"].as_u64().unwrap();
+        let end = c["pages"]["end"].as_u64().unwrap();
+        let count = c["pages"]["count"].as_u64().unwrap();
+        assert_eq!(start, expected_next, "chunk start/gap mismatch");
+        assert_eq!(end - start + 1, count, "pages.count mismatch");
+        assert!(c["filename"].as_str().unwrap().ends_with(".pdf"));
+        expected_next = end + 1;
+    }
+    assert_eq!(expected_next, 7, "chunks did not cover all 6 pages");
 }

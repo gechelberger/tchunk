@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use rayon::ThreadPool;
 
 use tchunk_pdf::cli::{Cli, TokenizerKind};
+use tchunk_pdf::index::{self, ChunkEntry, Config, Index, Pages, Source, Warning};
 use tchunk_pdf::pdf::Pdf;
 use tchunk_pdf::plan::{plan_chunks, BoundaryLevel, Diagnostic};
 use tchunk_pdf::tokenize::{TiktokenTokenizer, Tokenizer, WordCountTokenizer};
@@ -92,9 +93,11 @@ fn run(cli: Cli) -> Result<(), RunError> {
     });
     let images_elapsed = t_images.elapsed();
 
-    emit_content_warnings(&cli.input, &tokens, &images);
+    let mut warnings: Vec<Warning> = Vec::new();
+    warnings.extend(emit_content_warnings(&cli.input, &tokens, &images));
 
-    let mut split_at: BoundaryLevel = cli.split_at.into();
+    let requested_split_at: BoundaryLevel = cli.split_at.into();
+    let mut split_at = requested_split_at;
     let mut boundaries = pdf.boundaries();
 
     if split_at > BoundaryLevel::Page && !pdf.has_outline() {
@@ -102,6 +105,9 @@ fn run(cli: Cli) -> Result<(), RunError> {
             "warning: no outline present in PDF; --split-at {:?} ignored, falling back to page.",
             cli.split_at
         );
+        warnings.push(Warning::OutlineMissing {
+            requested: index::boundary_level_str(requested_split_at),
+        });
         split_at = BoundaryLevel::Page;
         boundaries = vec![BoundaryLevel::Page; page_count];
     }
@@ -115,11 +121,13 @@ fn run(cli: Cli) -> Result<(), RunError> {
                     "warning: page {page} has {t} tokens, which exceeds --max-tokens {}; emitted as its own chunk.",
                     cli.max_tokens
                 );
+                warnings.push(Warning::OversizedPage { page: *page, tokens: *t });
             }
             Diagnostic::ForcedMidLevelCut { after_page } => {
                 eprintln!(
                     "warning: forced page-level cut after page {after_page} — no allowed cut at --split-at level was reachable within budget."
                 );
+                warnings.push(Warning::ForcedMidLevelCut { after_page: *after_page });
             }
         }
     }
@@ -158,18 +166,20 @@ fn run(cli: Cli) -> Result<(), RunError> {
     };
 
     let t_write = Instant::now();
+    let mut chunk_entries: Vec<ChunkEntry> = Vec::with_capacity(total);
     for (i, page_nums) in plan.chunks.iter().enumerate() {
         let idx = i + 1;
         let filename = format!("{prefix}_{idx:0width$}.pdf", width = pad);
         let out_path: PathBuf = cli.output_dir.join(&filename);
 
+        let tok_sum: usize = page_nums
+            .iter()
+            .map(|&p| tokens[(p - 1) as usize])
+            .sum();
+        let first = *page_nums.first().unwrap();
+        let last = *page_nums.last().unwrap();
+
         if cli.verbose {
-            let tok_sum: usize = page_nums
-                .iter()
-                .map(|&p| tokens[(p - 1) as usize])
-                .sum();
-            let first = *page_nums.first().unwrap();
-            let last = *page_nums.last().unwrap();
             eprintln!(
                 "  {filename}: pages {first}-{last} ({} pages, {tok_sum} tokens)",
                 page_nums.len()
@@ -179,9 +189,38 @@ fn run(cli: Cli) -> Result<(), RunError> {
         pdf.write_chunk(page_nums, &out_path)
             .map_err(RunError::Output)?;
         write_pb.inc(1);
+
+        chunk_entries.push(ChunkEntry {
+            filename,
+            pages: Pages {
+                start: first,
+                end: last,
+                count: page_nums.len(),
+            },
+            token_count: tok_sum,
+        });
     }
     write_pb.finish();
     let write_elapsed = t_write.elapsed();
+
+    let index = Index {
+        tool: "tchunk-pdf",
+        version: env!("CARGO_PKG_VERSION"),
+        source: Source {
+            path: cli.input.display().to_string(),
+            page_count,
+        },
+        config: Config {
+            tokenizer: tokenizer.name().to_string(),
+            max_tokens: cli.max_tokens,
+            split_at_requested: index::boundary_level_str(requested_split_at),
+            split_at_effective: index::boundary_level_str(split_at),
+        },
+        chunks: chunk_entries,
+        warnings,
+    };
+    let index_path = cli.output_dir.join(format!("{prefix}.index.json"));
+    index.write(&index_path).map_err(RunError::Output)?;
 
     eprintln!(
         "timing: extract {} | tokenize {} | image-scan {} | write {} chunks {}",
@@ -261,10 +300,15 @@ fn pad_width(total: usize) -> usize {
     natural.max(3)
 }
 
-fn emit_content_warnings(input: &std::path::Path, tokens: &[usize], images: &[usize]) {
+fn emit_content_warnings(
+    input: &std::path::Path,
+    tokens: &[usize],
+    images: &[usize],
+) -> Vec<Warning> {
+    let mut out = Vec::new();
     let total_pages = tokens.len();
     if total_pages == 0 {
-        return;
+        return out;
     }
     let near_empty = tokens
         .iter()
@@ -280,7 +324,11 @@ fn emit_content_warnings(input: &std::path::Path, tokens: &[usize], images: &[us
             near_empty,
             total_pages
         );
-        return;
+        out.push(Warning::ScanLike {
+            near_empty_pages: near_empty,
+            total_pages,
+        });
+        return out;
     }
 
     let image_dominant = tokens
@@ -294,5 +342,10 @@ fn emit_content_warnings(input: &std::path::Path, tokens: &[usize], images: &[us
              Token counts underestimate their size; downstream tools may handle them differently.",
             image_dominant, total_pages
         );
+        out.push(Warning::ImageDominant {
+            pages_affected: image_dominant,
+            total_pages,
+        });
     }
+    out
 }
