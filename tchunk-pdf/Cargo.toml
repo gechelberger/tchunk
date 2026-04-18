@@ -21,3 +21,4 @@ lopdf = "0.36"
 tiktoken-rs = "0.7"
 indexmap = "2"
 indicatif = "0.17"
+rayon = { workspace = true }

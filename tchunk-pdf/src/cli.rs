@@ -78,4 +78,9 @@ pub struct Cli {
     /// Print per-chunk page ranges and token totals to stderr.
     #[arg(short = 'v', long)]
     pub verbose: bool,
+
+    /// Worker threads for per-page extract/tokenize/image-scan. `1` = sequential; `0` =
+    /// auto-detect (use all available cores). Chunk writing stays sequential.
+    #[arg(short = 'j', long, default_value_t = 1)]
+    pub jobs: usize,
 }

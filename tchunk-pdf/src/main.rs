@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use rayon::ThreadPool;
 
 use tchunk_pdf::cli::Cli;
 use tchunk_pdf::pdf::Pdf;
@@ -49,27 +51,42 @@ fn run(cli: Cli) -> Result<(), RunError> {
 
     let tokenizer = TiktokenTokenizer::new(cli.tokenizer.as_str()).map_err(RunError::Input)?;
 
+    let pool = build_pool(cli.jobs).map_err(RunError::Input)?;
+    let page_nums = pdf.page_nums();
+
     let extract_pb = spinner(&format!("Extracting text from {page_count} pages..."));
     let t_extract = Instant::now();
-    let texts = pdf.page_texts();
+    let texts: Vec<String> = pool.install(|| {
+        page_nums
+            .par_iter()
+            .map(|&n| pdf.page_text(n))
+            .collect()
+    });
     let extract_elapsed = t_extract.elapsed();
     extract_pb.finish();
 
     let tok_pb = page_bar(page_count as u64, "Tokenizing");
     let t_tokenize = Instant::now();
-    let tokens: Vec<usize> = texts
-        .iter()
-        .map(|t| {
-            let n = tokenizer.count(t);
-            tok_pb.inc(1);
-            n
-        })
-        .collect();
+    let tokens: Vec<usize> = pool.install(|| {
+        texts
+            .par_iter()
+            .map(|t| {
+                let n = tokenizer.count(t);
+                tok_pb.inc(1);
+                n
+            })
+            .collect()
+    });
     let tokenize_elapsed = t_tokenize.elapsed();
     tok_pb.finish();
 
     let t_images = Instant::now();
-    let images = pdf.image_counts();
+    let images: Vec<usize> = pool.install(|| {
+        page_nums
+            .par_iter()
+            .map(|&n| pdf.image_count(n))
+            .collect()
+    });
     let images_elapsed = t_images.elapsed();
 
     emit_content_warnings(&cli.input, &tokens, &images);
@@ -173,6 +190,16 @@ fn run(cli: Cli) -> Result<(), RunError> {
     );
 
     Ok(())
+}
+
+fn build_pool(jobs: usize) -> anyhow::Result<ThreadPool> {
+    let mut builder = rayon::ThreadPoolBuilder::new();
+    if jobs != 0 {
+        builder = builder.num_threads(jobs);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build thread pool: {e}"))
 }
 
 fn fmt_dur(d: Duration) -> String {

@@ -933,6 +933,7 @@ dependencies = [
  "indexmap",
  "indicatif",
  "lopdf",
+ "rayon",
  "thiserror",
  "tiktoken-rs",
 ]

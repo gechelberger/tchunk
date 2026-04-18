@@ -49,6 +49,7 @@ tchunk-pdf my-book.pdf -v
 | `-p`  | `--prefix`       | input stem    | Output filename prefix. |
 | `-t`  | `--tokenizer`    | `cl100k_base` | `cl100k_base` or `o200k_base` (tiktoken BPE). |
 | `-v`  | `--verbose`      | off           | Print per-chunk page ranges and token totals to stderr. |
+| `-j`  | `--jobs`         | `1`           | Per-page worker threads for extract/tokenize/image-scan. `1` sequential, `0` auto-detect. |
 
 ## Output
 
@@ -105,6 +106,19 @@ tchunk-pdf input-ocr.pdf
 - `1` — input file missing, unreadable, or not a valid PDF.
 - `2` — CLI argument error (handled by `clap`).
 - `3` — output path not writable.
+
+## Performance
+
+Extract and tokenize are the two dominant costs and are both per-page, so both parallelize with `-j/--jobs`. Chunk writing stays sequential (it's I/O-bound and a small share of total time).
+
+Benchmark: [USCODE-2011-title26.pdf](https://www.govinfo.gov/content/pkg/USCODE-2011-title26/pdf/USCODE-2011-title26.pdf) (~3800 pages, 15 output chunks at the default 500k token budget).
+
+| Stage      | `-j 1` | `-j 4` | `-j 0` (auto) |
+|------------|-------:|-------:|--------------:|
+| extract    | 20.67s |  6.11s |         5.01s |
+| tokenize   |  5.82s |  3.26s |         2.56s |
+| image-scan |    5ms |    3ms |           3ms |
+| write (14) |  818ms |  855ms |         1.01s |
 
 ## Limitations / deferred
 

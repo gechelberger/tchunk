@@ -24,6 +24,24 @@ impl Pdf {
         self.pages.len()
     }
 
+    /// 1-based page numbers in document order.
+    pub fn page_nums(&self) -> Vec<u32> {
+        self.pages.keys().copied().collect()
+    }
+
+    /// Extracted text for a single 1-based page number. Missing or errored pages return `""`.
+    pub fn page_text(&self, page_num: u32) -> String {
+        self.doc.extract_text(&[page_num]).unwrap_or_default()
+    }
+
+    /// Number of `/Subtype /Image` XObjects referenced by a single 1-based page number.
+    pub fn image_count(&self, page_num: u32) -> usize {
+        match self.pages.get(&page_num) {
+            Some(&page_id) => self.count_images_on_page(page_id),
+            None => 0,
+        }
+    }
+
     /// Per-page text. Returns one String per page (length == page_count).
     ///
     /// Uses `lopdf::Document::extract_text` on the already-parsed Document (no second PDF parse),
@@ -31,21 +49,18 @@ impl Pdf {
     /// but we only use this for token *counting* — approximate is fine. Per-page failures yield
     /// empty strings (will look like a near-empty page to the scan-like warning).
     pub fn page_texts(&self) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.pages.len());
-        for &page_num in self.pages.keys() {
-            let text = self.doc.extract_text(&[page_num]).unwrap_or_default();
-            out.push(text);
-        }
-        out
+        self.pages
+            .keys()
+            .map(|&n| self.page_text(n))
+            .collect()
     }
 
     /// Number of `/Subtype /Image` XObjects referenced by each page (1-based indexed).
     pub fn image_counts(&self) -> Vec<usize> {
-        let mut counts = Vec::with_capacity(self.pages.len());
-        for (_pn, page_id) in &self.pages {
-            counts.push(self.count_images_on_page(*page_id));
-        }
-        counts
+        self.pages
+            .values()
+            .map(|&id| self.count_images_on_page(id))
+            .collect()
     }
 
     fn count_images_on_page(&self, page_id: ObjectId) -> usize {
