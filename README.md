@@ -8,6 +8,15 @@ This is a Cargo workspace. Each member is a standalone CLI for a specific docume
 
 ## Quick start (PDF)
 
+Install directly from git:
+
+```sh
+cargo install --git https://github.com/gechelberger/tchunk --bin tchunk-pdf
+tchunk-pdf my-book.pdf --max-tokens 500000 --output-dir ./out/
+```
+
+Or from a local checkout:
+
 ```sh
 cargo install --path tchunk-pdf
 tchunk-pdf my-book.pdf --max-tokens 500000 --output-dir ./out/
