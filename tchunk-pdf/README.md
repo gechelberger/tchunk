@@ -209,4 +209,4 @@ Benchmark: [USCODE-2011-title26.pdf](https://www.govinfo.gov/content/pkg/USCODE-
 
 ## License
 
-Apache-2.0
+Dual-licensed under [MIT](../LICENSE-MIT) or [Apache-2.0](../LICENSE-APACHE) at your option. See the [workspace README](../README.md#license) for details.
