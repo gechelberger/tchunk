@@ -88,7 +88,7 @@ pub struct Cli {
     pub prefix: Option<String>,
 
     /// Tokenizer used to count tokens per page.
-    #[arg(short = 't', long, value_enum, default_value_t = TokenizerKind::O200kBase)]
+    #[arg(short = 't', long, value_enum, default_value_t = TokenizerKind::WordCount)]
     pub tokenizer: TokenizerKind,
 
     /// Path to a HuggingFace tokenizer.json. Requires `-t huggingface`.

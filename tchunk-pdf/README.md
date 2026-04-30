@@ -57,7 +57,7 @@ files) — run `tchunk-pdf` once per file in that case.
 | `-s`  | `--split-at`     | `page`        | Coarsest level a split is allowed at: `page`, `any-bookmark`, `subsection`, `section`, `chapter`. |
 | `-o`  | `--output-dir`   | `.`           | Output directory (created if missing). |
 | `-p`  | `--prefix`       | input stem    | Output filename prefix. Rejected if more than one input is given. |
-| `-t`  | `--tokenizer`    | `o200k_base`  | `cl100k_base`, `o200k_base`, `word_count`, or `huggingface` (see [Tokenizers](#tokenizers)). |
+| `-t`  | `--tokenizer`    | `word_count`  | `cl100k_base`, `o200k_base`, `word_count`, or `huggingface` (see [Tokenizers](#tokenizers)). |
 | `-v`  | `--verbose`      | off           | Print per-chunk page ranges and token totals to stderr. |
 | `-q`  | `--quiet`        | off           | Suppress warnings on stderr. Errors still print; warnings remain in the index sidecar. |
 | `-j`  | `--jobs`         | `1`           | N threads for extract/tokenize/image-scan. `1` sequential, `0` auto-detect. |
@@ -115,9 +115,9 @@ Warning entries are tagged objects: `scan_like`, `image_dominant`, `outline_miss
 
 Four options, selected with `-t/--tokenizer`:
 
-- **`o200k_base`** (default) — tiktoken BPE used by GPT-4o and newer OpenAI models. Good general-purpose proxy for modern LLM token counts.
+- **`word_count`** (default) — whitespace-split word count with non-alphanumeric chars treated as word boundaries (so `"hello,world"` is 2, `"don't"` is 2). Simple and fast, no model data loaded. Useful when you want "words per chunk" as the budget unit rather than LLM tokens.
+- **`o200k_base`** — tiktoken BPE used by GPT-4o and newer OpenAI models. Good general-purpose proxy for modern LLM token counts.
 - **`cl100k_base`** — tiktoken BPE used by GPT-3.5/4 and many older LLMs.
-- **`word_count`** — whitespace-split word count with non-alphanumeric chars treated as word boundaries (so `"hello,world"` is 2, `"don't"` is 2). Simple and fast, no model data loaded. Useful when you want "words per chunk" as the budget unit rather than LLM tokens.
 - **`huggingface`** — any tokenizer that ships a `tokenizer.json` (Llama, Mistral, Gemma, Qwen, DeepSeek, BERT-family, etc.). Requires either `--tokenizer-file <PATH>` or `--tokenizer-model <HF_MODEL_ID>`.
 
 NotebookLM doesn't publish its tokenizer, so the BPE options are generic LLM-token proxies — close enough for sizing, not exact.
