@@ -10,7 +10,7 @@ use rayon::ThreadPool;
 use tchunk_pdf::cli::{Cli, TokenizerKind};
 use tchunk_pdf::index::{ChunkEntry, Config, Index, Pages, Source, Warning};
 use tchunk_pdf::pdf::Pdf;
-use tchunk_pdf::plan::{plan_chunks, BoundaryLevel, Diagnostic};
+use tchunk_pdf::plan::{plan_chunks, Boundary, Diagnostic, SplitAt};
 use tchunk_pdf::tokenize::{HuggingFaceTokenizer, TiktokenTokenizer, Tokenizer, WordCountTokenizer};
 
 const SCAN_LIKE_TOKEN_THRESHOLD: usize = 20;
@@ -128,22 +128,21 @@ fn process_input(
     let mut warnings: Vec<Warning> = Vec::new();
     warnings.extend(emit_content_warnings(input, &tokens, &images, cli.quiet));
 
-    let requested_split_at: BoundaryLevel = cli.split_at.into();
+    let requested_split_at: SplitAt = cli.resolved_split_at();
     let mut split_at = requested_split_at;
     let mut boundaries = pdf.boundaries();
 
-    if split_at > BoundaryLevel::Page && !pdf.has_outline() {
+    if split_at != SplitAt::Page && !pdf.has_outline() {
         if !cli.quiet {
             eprintln!(
-                "warning: no outline present in PDF; --split-at {:?} ignored, falling back to page.",
-                cli.split_at
+                "warning: no outline present in PDF; --split-at {requested_split_at} ignored, falling back to page."
             );
         }
         warnings.push(Warning::OutlineMissing {
-            requested: requested_split_at.as_str(),
+            requested: requested_split_at.to_string(),
         });
-        split_at = BoundaryLevel::Page;
-        boundaries = vec![BoundaryLevel::Page; page_count];
+        split_at = SplitAt::Page;
+        boundaries = vec![Boundary::Page; page_count];
     }
 
     let plan = plan_chunks(&tokens, &boundaries, split_at, cli.max_tokens);
@@ -179,11 +178,10 @@ fn process_input(
 
     if cli.verbose {
         eprintln!(
-            "tchunk-pdf: {} pages -> {} chunks (budget {} tokens, split-at {:?}, tokenizer {})",
+            "tchunk-pdf: {} pages -> {} chunks (budget {} tokens, split-at {split_at}, tokenizer {})",
             page_count,
             total,
             cli.max_tokens,
-            split_at,
             tokenizer.name(),
         );
     }
@@ -213,7 +211,7 @@ fn process_input(
             eprintln!(
                 "  {filename}: pages {first}-{last} ({} pages, {tok_sum} tokens, level {})",
                 page_nums.len(),
-                chunk.effective_level.as_str(),
+                chunk.effective_level,
             );
         }
 
@@ -229,7 +227,7 @@ fn process_input(
                 count: page_nums.len(),
             },
             token_count: tok_sum,
-            effective_level: chunk.effective_level.as_str(),
+            effective_level: chunk.effective_level.to_string(),
         });
     }
     write_pb.finish();
@@ -238,11 +236,12 @@ fn process_input(
     // split_at_effective reports the finest level actually used across chunks, so a user can
     // see at a glance whether their requested level was honored everywhere (same as requested)
     // or whether any unit had to be recursed to a finer level (shows the finest such level).
-    let effective_level = plan
+    // SplitAt's derived Ord goes coarsest→finest, so .max() picks the finest.
+    let effective_level: SplitAt = plan
         .chunks
         .iter()
         .map(|c| c.effective_level)
-        .min()
+        .max()
         .unwrap_or(split_at);
 
     let index = Index {
@@ -256,8 +255,8 @@ fn process_input(
         config: Config {
             tokenizer: tokenizer.name().to_string(),
             max_tokens: cli.max_tokens,
-            split_at_requested: requested_split_at.as_str(),
-            split_at_effective: effective_level.as_str(),
+            split_at_requested: requested_split_at.to_string(),
+            split_at_effective: effective_level.to_string(),
         },
         chunks: chunk_entries,
         warnings,

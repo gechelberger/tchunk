@@ -24,8 +24,8 @@ pub struct Source {
 pub struct Config {
     pub tokenizer: String,
     pub max_tokens: usize,
-    pub split_at_requested: &'static str,
-    pub split_at_effective: &'static str,
+    pub split_at_requested: String,
+    pub split_at_effective: String,
 }
 
 #[derive(Serialize)]
@@ -33,7 +33,7 @@ pub struct ChunkEntry {
     pub filename: String,
     pub pages: Pages,
     pub token_count: usize,
-    pub effective_level: &'static str,
+    pub effective_level: String,
 }
 
 #[derive(Serialize)]
@@ -47,7 +47,7 @@ pub struct Pages {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Warning {
     OutlineMissing {
-        requested: &'static str,
+        requested: String,
     },
     OversizedPage {
         page: u32,
@@ -90,14 +90,14 @@ mod tests {
             config: Config {
                 tokenizer: "cl100k_base".to_string(),
                 max_tokens: 500_000,
-                split_at_requested: "page",
-                split_at_effective: "page",
+                split_at_requested: "page".to_string(),
+                split_at_effective: "page".to_string(),
             },
             chunks: vec![ChunkEntry {
                 filename: "book_001.pdf".to_string(),
                 pages: Pages { start: 1, end: 10, count: 10 },
                 token_count: 1234,
-                effective_level: "page",
+                effective_level: "page".to_string(),
             }],
             warnings: vec![],
         };
@@ -116,8 +116,8 @@ mod tests {
 
     #[test]
     fn outline_missing_serializes_requested() {
-        let w = Warning::OutlineMissing { requested: "chapter" };
+        let w = Warning::OutlineMissing { requested: "depth-1".to_string() };
         let json = serde_json::to_string(&w).unwrap();
-        assert_eq!(json, r#"{"kind":"outline_missing","requested":"chapter"}"#);
+        assert_eq!(json, r#"{"kind":"outline_missing","requested":"depth-1"}"#);
     }
 }

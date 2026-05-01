@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use clap::{ArgGroup, Parser, ValueEnum};
 use indexmap::IndexSet;
 
-use crate::plan::BoundaryLevel;
+use crate::plan::SplitAt;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum SplitAt {
+pub enum SplitAtArg {
     Page,
     #[value(name = "any-bookmark", alias = "bookmark")]
     AnyBookmark,
@@ -15,14 +15,14 @@ pub enum SplitAt {
     Chapter,
 }
 
-impl From<SplitAt> for BoundaryLevel {
-    fn from(s: SplitAt) -> Self {
+impl From<SplitAtArg> for SplitAt {
+    fn from(s: SplitAtArg) -> Self {
         match s {
-            SplitAt::Page => BoundaryLevel::Page,
-            SplitAt::AnyBookmark => BoundaryLevel::AnyBookmark,
-            SplitAt::Subsection => BoundaryLevel::Subsection,
-            SplitAt::Section => BoundaryLevel::Section,
-            SplitAt::Chapter => BoundaryLevel::Chapter,
+            SplitAtArg::Page => SplitAt::Page,
+            SplitAtArg::AnyBookmark => SplitAt::AnyBookmark,
+            SplitAtArg::Subsection => SplitAt::Depth(3),
+            SplitAtArg::Section => SplitAt::Depth(2),
+            SplitAtArg::Chapter => SplitAt::Depth(1),
         }
     }
 }
@@ -61,6 +61,12 @@ impl TokenizerKind {
             .multiple(false)
             .required(false),
     ),
+    group(
+        ArgGroup::new("split_target")
+            .args(["split_at", "split_at_depth"])
+            .multiple(false)
+            .required(false),
+    ),
 )]
 pub struct Cli {
     /// Input PDF file(s). Each is chunked independently; outputs for each input use
@@ -74,9 +80,17 @@ pub struct Cli {
 
     /// Coarsest level at which a split between chunks is allowed. Outline-based levels
     /// require the PDF to have a bookmarks tree;
-    /// otherwise they fall back to `page` with a warning.
-    #[arg(short = 's', long, value_enum, default_value_t = SplitAt::Chapter)]
-    pub split_at: SplitAt,
+    /// otherwise they fall back to `page` with a warning. Mutually exclusive with
+    /// `--split-at-depth`.
+    #[arg(short = 's', long, value_enum, default_value_t = SplitAtArg::Chapter)]
+    pub split_at: SplitAtArg,
+
+    /// Coarsest outline depth at which a split is allowed. Equivalent to `--split-at chapter`
+    /// at depth 1, `--split-at section` at depth 2, etc., but lets you target depths beyond
+    /// the named flags (e.g. `--split-at-depth 4` for a deeply-nested outline). Mutually
+    /// exclusive with `--split-at`.
+    #[arg(long = "split-at-depth", value_name = "N")]
+    pub split_at_depth: Option<u32>,
 
     /// Output directory (created if missing).
     #[arg(short = 'o', long, default_value = ".")]
@@ -117,6 +131,16 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Resolve the user's split-at request to a `SplitAt`. `--split-at-depth N` takes
+    /// precedence over the named `--split-at` flag when both are supplied (clap's
+    /// ArgGroup ensures they aren't, but be explicit anyway).
+    pub fn resolved_split_at(&self) -> SplitAt {
+        match self.split_at_depth {
+            Some(n) => SplitAt::Depth(n),
+            None => self.split_at.into(),
+        }
+    }
+
     /// Post-parse validation that clap can't express declaratively. Also expands
     /// any glob patterns in `inputs` (shells on Windows don't glob, so the tool does).
     pub fn validate(&mut self) -> anyhow::Result<()> {
@@ -254,5 +278,50 @@ mod tests {
     #[test]
     fn nul_rejected() {
         assert!(validate_prefix("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn split_at_and_split_at_depth_are_mutually_exclusive() {
+        use clap::Parser;
+        let result = Cli::try_parse_from([
+            "tchunk-pdf",
+            "input.pdf",
+            "--split-at",
+            "chapter",
+            "--split-at-depth",
+            "2",
+        ]);
+        assert!(result.is_err(), "expected ArgGroup conflict, got: {:?}", result);
+    }
+
+    #[test]
+    fn split_at_depth_resolves_to_depth_variant() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["tchunk-pdf", "input.pdf", "--split-at-depth", "5"])
+            .expect("parse");
+        assert_eq!(cli.resolved_split_at(), SplitAt::Depth(5));
+    }
+
+    #[test]
+    fn split_at_chapter_resolves_to_depth_1() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["tchunk-pdf", "input.pdf", "--split-at", "chapter"])
+            .expect("parse");
+        assert_eq!(cli.resolved_split_at(), SplitAt::Depth(1));
+    }
+
+    #[test]
+    fn split_at_any_bookmark_resolves_to_anybookmark() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["tchunk-pdf", "input.pdf", "--split-at", "any-bookmark"])
+            .expect("parse");
+        assert_eq!(cli.resolved_split_at(), SplitAt::AnyBookmark);
+    }
+
+    #[test]
+    fn default_split_at_is_chapter_depth_1() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["tchunk-pdf", "input.pdf"]).expect("parse");
+        assert_eq!(cli.resolved_split_at(), SplitAt::Depth(1));
     }
 }

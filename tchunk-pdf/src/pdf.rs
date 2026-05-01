@@ -5,7 +5,7 @@ use anyhow::{anyhow, Context, Result};
 use indexmap::IndexMap;
 use lopdf::{Destination, Document, Object, ObjectId, Outline};
 
-use crate::plan::BoundaryLevel;
+use crate::plan::Boundary;
 
 pub struct Pdf {
     doc: Document,
@@ -91,16 +91,17 @@ impl Pdf {
         count
     }
 
-    /// Boundary level that starts at each page (1-based indexed). Defaults to `Page` when no
-    /// outline entry targets that page. If the document has no `/Outlines` at all, every entry
-    /// is `Page`.
-    pub fn boundaries(&self) -> Vec<BoundaryLevel> {
-        let mut levels = vec![BoundaryLevel::Page; self.pages.len()];
+    /// Boundary that starts at each page (1-based indexed). Defaults to `Page` when no outline
+    /// entry targets that page. If the document has no `/Outlines` at all, every entry is `Page`.
+    /// When multiple outline entries point at the same page, keep the *coarsest* (smallest depth).
+    pub fn boundaries(&self) -> Vec<Boundary> {
+        let mut levels = vec![Boundary::Page; self.pages.len()];
         if levels.is_empty() {
             return levels;
         }
-        // First page always starts the document.
-        levels[0] = BoundaryLevel::Chapter;
+        // First page always starts the document. depth=1 preserves prior behavior:
+        // any non-Page split-at request is honored at the first page without special-casing.
+        levels[0] = Boundary::Bookmark { depth: 1 };
 
         let page_id_to_num: std::collections::HashMap<ObjectId, u32> =
             self.pages.iter().map(|(n, id)| (*id, *n)).collect();
@@ -115,16 +116,25 @@ impl Pdf {
             nodes: &[Outline],
             depth: u32,
             page_id_to_num: &std::collections::HashMap<ObjectId, u32>,
-            levels: &mut [BoundaryLevel],
+            levels: &mut [Boundary],
         ) {
             for node in nodes {
                 match node {
                     Outline::Destination(dest) => {
                         if let Some(page) = resolve_page(dest, page_id_to_num) {
-                            let lvl = BoundaryLevel::from_outline_depth(depth);
                             let idx = (page - 1) as usize;
-                            if idx < levels.len() && lvl > levels[idx] {
-                                levels[idx] = lvl;
+                            if idx >= levels.len() {
+                                continue;
+                            }
+                            // Keep the coarsest (smallest depth) entry per page.
+                            match levels[idx] {
+                                Boundary::Page => {
+                                    levels[idx] = Boundary::Bookmark { depth };
+                                }
+                                Boundary::Bookmark { depth: cur } if depth < cur => {
+                                    levels[idx] = Boundary::Bookmark { depth };
+                                }
+                                _ => {}
                             }
                         }
                     }
