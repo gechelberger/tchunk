@@ -3,3 +3,4 @@
 Cargo.lock.bak
 .DS_Store
 /lorem-ipsum
+.claude/settings.local.json
