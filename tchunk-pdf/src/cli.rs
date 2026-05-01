@@ -129,6 +129,10 @@ impl Cli {
             );
         }
 
+        if let Some(p) = self.prefix.as_deref() {
+            validate_prefix(p)?;
+        }
+
         let has_hf_source = self.tokenizer_file.is_some() || self.tokenizer_model.is_some();
         match self.tokenizer {
             TokenizerKind::HuggingFace if !has_hf_source => anyhow::bail!(
@@ -185,5 +189,70 @@ impl Cli {
 
         self.inputs = out.into_iter().collect();
         Ok(())
+    }
+}
+
+/// Reject prefixes that could let output files escape `--output-dir`. A prefix is used
+/// verbatim as the leading component of generated filenames, so it must be a single path
+/// component with no separators or other path-meaningful characters.
+fn validate_prefix(p: &str) -> anyhow::Result<()> {
+    if p.is_empty() {
+        anyhow::bail!("--prefix must not be empty");
+    }
+    if p == "." || p == ".." {
+        anyhow::bail!("--prefix must not be {p:?}");
+    }
+    if let Some(c) = p.chars().find(|&c| matches!(c, '/' | '\\' | ':' | '\0')) {
+        anyhow::bail!(
+            "--prefix must not contain path separators, ':' or NUL (got {p:?}, found {c:?})"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_prefixes_accepted() {
+        assert!(validate_prefix("book").is_ok());
+        assert!(validate_prefix("my-document").is_ok());
+        assert!(validate_prefix("chapter_01").is_ok());
+        assert!(validate_prefix(".dotfile").is_ok());
+        assert!(validate_prefix("name with spaces").is_ok());
+    }
+
+    #[test]
+    fn empty_prefix_rejected() {
+        assert!(validate_prefix("").is_err());
+    }
+
+    #[test]
+    fn dot_and_dotdot_rejected() {
+        assert!(validate_prefix(".").is_err());
+        assert!(validate_prefix("..").is_err());
+    }
+
+    #[test]
+    fn separator_rejected() {
+        assert!(validate_prefix("foo/bar").is_err());
+        assert!(validate_prefix("foo\\bar").is_err());
+        assert!(validate_prefix("../escape").is_err());
+        assert!(validate_prefix("/absolute").is_err());
+        assert!(validate_prefix("\\absolute").is_err());
+    }
+
+    #[test]
+    fn colon_rejected() {
+        // Windows interprets these as drive-relative or alternate-data-stream paths,
+        // either of which can land outside --output-dir.
+        assert!(validate_prefix("C:foo").is_err());
+        assert!(validate_prefix("file:stream").is_err());
+    }
+
+    #[test]
+    fn nul_rejected() {
+        assert!(validate_prefix("foo\0bar").is_err());
     }
 }
