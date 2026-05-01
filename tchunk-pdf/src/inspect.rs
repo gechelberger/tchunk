@@ -77,6 +77,41 @@ fn format_span(min: u32, max: u32) -> String {
     }
 }
 
+/// Print an indented outline tree to `out`. Each line is `[pN] <indent><title>`, with
+/// `[pN]` left-aligned and width-padded to the document's max page count, and `<indent>`
+/// = 2 spaces per depth level (depth 1 = 0 indent, depth 2 = 2 spaces, etc.). Empty
+/// `entries` prints "<page_count> pages, no outline present".
+pub fn print_tree<W: Write>(
+    out: &mut W,
+    entries: &[OutlineEntry],
+    page_count: usize,
+) -> io::Result<()> {
+    if entries.is_empty() {
+        writeln!(out, "{page_count} pages, no outline present")?;
+        return Ok(());
+    }
+    let prefix_width = page_prefix_width(page_count);
+    for e in entries {
+        let prefix = format!("[p{}]", e.page);
+        let pad = prefix_width.saturating_sub(prefix.len());
+        let indent = "  ".repeat((e.depth.saturating_sub(1)) as usize);
+        let title = if e.title.is_empty() { "(untitled)" } else { e.title.as_str() };
+        writeln!(out, "{prefix}{} {indent}{title}", " ".repeat(pad))?;
+    }
+    Ok(())
+}
+
+/// Width in columns of "[pN]" sized for the largest page number. e.g. page_count = 423
+/// → "[p423]" → 6.
+fn page_prefix_width(page_count: usize) -> usize {
+    let digits = if page_count == 0 {
+        1
+    } else {
+        (page_count as f64).log10() as usize + 1
+    };
+    "[p".len() + digits + "]".len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +202,47 @@ mod tests {
   at depth 3: 1 bookmark  → 3 segments, 4-11 pages long
 ";
         assert_eq!(got, expected, "got:\n{got}\nexpected:\n{expected}");
+    }
+
+    #[test]
+    fn print_tree_no_outline() {
+        let mut buf = Vec::new();
+        print_tree(&mut buf, &[], 100).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "100 pages, no outline present\n");
+    }
+
+    #[test]
+    fn print_tree_basic() {
+        let entries = vec![
+            OutlineEntry { depth: 1, page: 1, title: "Front Matter".into() },
+            OutlineEntry { depth: 2, page: 3, title: "Acknowledgements".into() },
+            OutlineEntry { depth: 1, page: 9, title: "Chapter 1".into() },
+            OutlineEntry { depth: 2, page: 11, title: "1.1 Background".into() },
+        ];
+        let mut buf = Vec::new();
+        print_tree(&mut buf, &entries, 423).unwrap();
+        let got = String::from_utf8(buf).unwrap();
+        // page_prefix_width("423") = 6 columns. "[p1]  " (4 chars + 2 spaces of pad)
+        // for the first entry, "[p3]  " for the second, "[p11] " for the fourth, etc.
+        let expected = "\
+[p1]   Front Matter
+[p3]     Acknowledgements
+[p9]   Chapter 1
+[p11]    1.1 Background
+";
+        assert_eq!(got, expected, "got:\n{got:?}\nexpected:\n{expected:?}");
+    }
+
+    #[test]
+    fn print_tree_empty_title_renders_untitled() {
+        let entries = vec![
+            OutlineEntry { depth: 1, page: 1, title: "".into() },
+        ];
+        let mut buf = Vec::new();
+        print_tree(&mut buf, &entries, 9).unwrap();
+        let got = String::from_utf8(buf).unwrap();
+        // page_prefix_width(9) = 4. "[p1] " = 4 chars + 1 pad space.
+        let expected = "[p1] (untitled)\n";
+        assert_eq!(got, expected, "got:\n{got:?}\nexpected:\n{expected:?}");
     }
 }
