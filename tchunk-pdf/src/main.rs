@@ -135,12 +135,11 @@ fn process_input(
     if split_at != SplitAt::Page && !pdf.has_outline() {
         if !cli.quiet {
             eprintln!(
-                "warning: no outline present in PDF; --split-at {} ignored, falling back to page.",
-                requested_split_at.as_str(),
+                "warning: no outline present in PDF; --split-at {requested_split_at} ignored, falling back to page."
             );
         }
         warnings.push(Warning::OutlineMissing {
-            requested: requested_split_at.as_str(),
+            requested: requested_split_at.to_string(),
         });
         split_at = SplitAt::Page;
         boundaries = vec![Boundary::Page; page_count];
@@ -179,11 +178,10 @@ fn process_input(
 
     if cli.verbose {
         eprintln!(
-            "tchunk-pdf: {} pages -> {} chunks (budget {} tokens, split-at {}, tokenizer {})",
+            "tchunk-pdf: {} pages -> {} chunks (budget {} tokens, split-at {split_at}, tokenizer {})",
             page_count,
             total,
             cli.max_tokens,
-            split_at.as_str(),
             tokenizer.name(),
         );
     }
@@ -213,7 +211,7 @@ fn process_input(
             eprintln!(
                 "  {filename}: pages {first}-{last} ({} pages, {tok_sum} tokens, level {})",
                 page_nums.len(),
-                chunk.effective_level.as_str(),
+                chunk.effective_level,
             );
         }
 
@@ -229,7 +227,7 @@ fn process_input(
                 count: page_nums.len(),
             },
             token_count: tok_sum,
-            effective_level: chunk.effective_level.as_str(),
+            effective_level: chunk.effective_level.to_string(),
         });
     }
     write_pb.finish();
@@ -238,12 +236,12 @@ fn process_input(
     // split_at_effective reports the finest level actually used across chunks, so a user can
     // see at a glance whether their requested level was honored everywhere (same as requested)
     // or whether any unit had to be recursed to a finer level (shows the finest such level).
-    // Larger finest_rank() = finer.
+    // SplitAt's derived Ord goes coarsest→finest, so .max() picks the finest.
     let effective_level: SplitAt = plan
         .chunks
         .iter()
         .map(|c| c.effective_level)
-        .max_by_key(|s| s.finest_rank())
+        .max()
         .unwrap_or(split_at);
 
     let index = Index {
@@ -257,8 +255,8 @@ fn process_input(
         config: Config {
             tokenizer: tokenizer.name().to_string(),
             max_tokens: cli.max_tokens,
-            split_at_requested: requested_split_at.as_str(),
-            split_at_effective: effective_level.as_str(),
+            split_at_requested: requested_split_at.to_string(),
+            split_at_effective: effective_level.to_string(),
         },
         chunks: chunk_entries,
         warnings,

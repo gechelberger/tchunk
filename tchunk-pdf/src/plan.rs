@@ -1,3 +1,4 @@
+use std::fmt;
 use std::ops::Range;
 
 /// Per-page outline data. Records the actual outline depth, with no level-name mapping.
@@ -7,59 +8,41 @@ pub enum Boundary {
     Bookmark { depth: u32 },
 }
 
-impl Boundary {
-    pub fn as_str(self) -> String {
-        match self {
-            Boundary::Page => "page".to_string(),
-            Boundary::Bookmark { depth } => format!("depth-{depth}"),
-        }
-    }
-}
-
 /// What the user (or recursion) is splitting at. Named CLI flags resolve to specific
 /// `SplitAt` values in `cli.rs`; everywhere else in the codebase works directly in
 /// depth-space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Variant order is load-bearing: derived `Ord` ranks coarsest→finest, so
+/// `Depth(1) < Depth(2) < ... < AnyBookmark < Page`. `main.rs` uses `.max()` to pick
+/// the finest level reached across chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SplitAt {
-    Page,
-    AnyBookmark,
     Depth(u32),
+    AnyBookmark,
+    Page,
 }
 
 impl SplitAt {
-    /// True if `b` is a valid cut point at this split level.
-    /// `Page` matches no `Boundary` directly — it is special-cased upstream
-    /// (every page is its own unit), so this method panics on `SplitAt::Page` to surface
-    /// any caller that forgot to special-case it.
+    /// True if `b` is a valid cut point at this split level. At `Page` level every page
+    /// boundary qualifies; at `AnyBookmark` any bookmark qualifies; at `Depth(N)` a
+    /// bookmark qualifies iff its depth is `<= N`.
     pub fn matches(&self, b: &Boundary) -> bool {
         match (self, b) {
-            (SplitAt::Page, _) => unreachable!("SplitAt::Page is special-cased upstream"),
+            (SplitAt::Page, _) => true,
             (SplitAt::AnyBookmark, Boundary::Bookmark { .. }) => true,
             (SplitAt::AnyBookmark, Boundary::Page) => false,
             (SplitAt::Depth(n), Boundary::Bookmark { depth }) => depth <= n,
             (SplitAt::Depth(_), Boundary::Page) => false,
         }
     }
+}
 
-    pub fn as_str(self) -> String {
+impl fmt::Display for SplitAt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SplitAt::Page => "page".to_string(),
-            SplitAt::AnyBookmark => "any-bookmark".to_string(),
-            SplitAt::Depth(n) => format!("depth-{n}"),
-        }
-    }
-
-    /// Rank this split-level on a coarsest→finest axis. Used by `main.rs` to pick the
-    /// finest level used across chunks for the `split_at_effective` sidecar field.
-    /// Larger return value = finer.
-    ///   `Depth(N)` → `(0, N)` — coarsest, ordered by depth.
-    ///   `AnyBookmark` → `(1, 0)` — finer than any specific `Depth`.
-    ///   `Page` → `(2, 0)` — finest.
-    pub fn finest_rank(self) -> (u8, u32) {
-        match self {
-            SplitAt::Depth(n) => (0, n),
-            SplitAt::AnyBookmark => (1, 0),
-            SplitAt::Page => (2, 0),
+            SplitAt::Page => f.write_str("page"),
+            SplitAt::AnyBookmark => f.write_str("any-bookmark"),
+            SplitAt::Depth(n) => write!(f, "depth-{n}"),
         }
     }
 }
@@ -278,39 +261,25 @@ fn next_effective_level(
     page_range: Range<usize>,
     current: SplitAt,
 ) -> SplitAt {
-    let start = page_range.start;
-    let end = page_range.end;
-
-    // From AnyBookmark, the only step finer is Page. From Page, no step finer.
+    // From AnyBookmark or Page, the only step finer is Page.
     let start_depth = match current {
-        SplitAt::Page => return SplitAt::Page,
-        SplitAt::AnyBookmark => return SplitAt::Page,
+        SplitAt::Page | SplitAt::AnyBookmark => return SplitAt::Page,
         SplitAt::Depth(n) => n,
     };
 
-    // Probe Depth(start_depth + 1), Depth(start_depth + 2), ... looking for the smallest depth
-    // that is *deeper than current* and has an interior boundary qualifying for it. Cap probing
-    // at the maximum depth actually present in the range (no point probing beyond that).
-    let max_interior_depth = (start + 1..end)
+    // The coarsest qualifying level is the smallest interior bookmark depth strictly greater
+    // than start_depth. One pass over the interior gives us that directly.
+    let min_deeper = (page_range.start + 1..page_range.end)
         .filter_map(|i| match boundaries[i] {
-            Boundary::Bookmark { depth } => Some(depth),
-            Boundary::Page => None,
+            Boundary::Bookmark { depth } if depth > start_depth => Some(depth),
+            _ => None,
         })
-        .max();
+        .min();
 
-    let max_d = match max_interior_depth {
-        Some(d) if d > start_depth => d,
-        _ => return SplitAt::Page,
-    };
-
-    for candidate in (start_depth + 1)..=max_d {
-        let cand = SplitAt::Depth(candidate);
-        let has_boundary = (start + 1..end).any(|i| cand.matches(&boundaries[i]));
-        if has_boundary {
-            return cand;
-        }
+    match min_deeper {
+        Some(d) => SplitAt::Depth(d),
+        None => SplitAt::Page,
     }
-    SplitAt::Page
 }
 
 /// Final doc-wide rebalance between the last two chunks. Preserved verbatim in semantics from
@@ -397,15 +366,8 @@ fn best_balanced_cut(
     budget: usize,
 ) -> Option<usize> {
     let n = tokens.len();
-    let cut_after_allowed = |idx0: usize| -> bool {
-        if idx0 + 1 == n {
-            return true;
-        }
-        match split_at {
-            SplitAt::Page => true, // every page boundary is a valid cut at Page level
-            other => other.matches(&boundaries[idx0 + 1]),
-        }
-    };
+    let cut_after_allowed =
+        |idx0: usize| -> bool { idx0 + 1 == n || split_at.matches(&boundaries[idx0 + 1]) };
 
     let total: usize = combined.iter().map(|&p| tokens[(p - 1) as usize]).sum();
 
@@ -847,22 +809,16 @@ mod tests {
     }
 
     #[test]
-    fn boundary_as_str_renders_depth() {
-        assert_eq!(Boundary::Page.as_str(), "page");
-        assert_eq!(Boundary::Bookmark { depth: 1 }.as_str(), "depth-1");
-        assert_eq!(Boundary::Bookmark { depth: 7 }.as_str(), "depth-7");
-    }
-
-    #[test]
-    fn splitat_as_str_covers_all_variants() {
-        assert_eq!(SplitAt::Page.as_str(), "page");
-        assert_eq!(SplitAt::AnyBookmark.as_str(), "any-bookmark");
-        assert_eq!(SplitAt::Depth(1).as_str(), "depth-1");
-        assert_eq!(SplitAt::Depth(42).as_str(), "depth-42");
+    fn splitat_display_covers_all_variants() {
+        assert_eq!(SplitAt::Page.to_string(), "page");
+        assert_eq!(SplitAt::AnyBookmark.to_string(), "any-bookmark");
+        assert_eq!(SplitAt::Depth(1).to_string(), "depth-1");
+        assert_eq!(SplitAt::Depth(42).to_string(), "depth-42");
     }
 
     #[test]
     fn splitat_matches_depth_threshold() {
+        let page_split = SplitAt::Page;
         let any_b = SplitAt::AnyBookmark;
         let d1 = SplitAt::Depth(1);
         let d2 = SplitAt::Depth(2);
@@ -870,6 +826,10 @@ mod tests {
         let b1 = Boundary::Bookmark { depth: 1 };
         let b2 = Boundary::Bookmark { depth: 2 };
         let b3 = Boundary::Bookmark { depth: 3 };
+
+        // Page matches everything (every page boundary qualifies at Page level).
+        assert!(page_split.matches(&page));
+        assert!(page_split.matches(&b1));
 
         // AnyBookmark matches every Bookmark, never Page.
         assert!(any_b.matches(&b1));
@@ -886,31 +846,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn splitat_page_matches_panics_to_catch_misuse() {
-        // Page is special-cased upstream; callers must not invoke matches() on it.
-        let _ = SplitAt::Page.matches(&Boundary::Page);
-    }
-
-    #[test]
-    fn finest_rank_orders_coarse_to_fine() {
-        use std::cmp::Ordering;
-        let pairs = [
-            (SplitAt::Depth(1), SplitAt::Depth(2), Ordering::Less),
-            (SplitAt::Depth(2), SplitAt::Depth(1), Ordering::Greater),
-            (SplitAt::Depth(5), SplitAt::AnyBookmark, Ordering::Less),
-            (SplitAt::AnyBookmark, SplitAt::Depth(99), Ordering::Greater),
-            (SplitAt::AnyBookmark, SplitAt::Page, Ordering::Less),
-            (SplitAt::Page, SplitAt::Depth(1), Ordering::Greater),
-        ];
-        for (a, b, want) in pairs {
-            assert_eq!(
-                a.finest_rank().cmp(&b.finest_rank()),
-                want,
-                "{:?} vs {:?}",
-                a,
-                b
-            );
-        }
+    fn splitat_ord_runs_coarse_to_fine() {
+        // Variant order in the enum declaration drives derive(Ord), so:
+        //   Depth(small N) < Depth(large N) < AnyBookmark < Page
+        assert!(SplitAt::Depth(1) < SplitAt::Depth(2));
+        assert!(SplitAt::Depth(99) < SplitAt::AnyBookmark);
+        assert!(SplitAt::AnyBookmark < SplitAt::Page);
+        assert!(SplitAt::Depth(1) < SplitAt::Page);
     }
 }
