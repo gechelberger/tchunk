@@ -122,6 +122,12 @@ fn synthesize_pdf_with_outline(
         (0..outline.len()).map(|_| doc.new_object_id()).collect();
     let outlines_id = doc.new_object_id();
 
+    // A dummy object used as the page reference for out-of-range entries. lopdf's get_toc
+    // requires all page destinations to be Object::Reference (it calls as_reference()?), so we
+    // use a valid reference to a non-page object rather than an Object::Integer. The dummy ID
+    // won't be in page_id_to_page_numbers, so get_toc silently skips such entries.
+    let dummy_id = doc.add_object(Object::Null);
+
     // Build parent/child links by walking entries with a depth stack.
     // `parent_at_depth[d]` = item id of the most-recent open item at depth d (if any);
     //   read on the `else` branch below to locate the parent of each deeper entry.
@@ -210,10 +216,11 @@ fn synthesize_pdf_with_outline(
         let page_ref = if (page as usize) >= 1 && (page as usize) <= page_count {
             page_ids[(page - 1) as usize].clone()
         } else {
-            // Out-of-range: emit a literal page number that won't resolve. lopdf's
-            // resolve_page handles Object::Integer too, so we use a literal integer
-            // beyond the range to force a skip.
-            Object::Integer((page as i64) - 1) // 0-based for Integer destinations
+            // Out-of-range: use a reference to the dummy object. lopdf's get_toc calls
+            // as_reference()? on the page field, so Object::Integer would cause the entire
+            // get_toc call to fail. A reference to a non-page object passes as_reference()
+            // but isn't found in page_id_to_page_numbers, so get_toc silently skips it.
+            Object::Reference(dummy_id)
         };
         let mut item = dictionary! {
             "Title" => Object::string_literal(title),
@@ -560,4 +567,73 @@ fn outline_entries_in_document_order() {
         })
         .collect();
     assert_eq!(entries, expected);
+}
+
+#[test]
+fn outline_entries_decodes_utf16be_bom_titles() {
+    // Build a PDF with a UTF-16BE-encoded title (BOM + big-endian UTF-16). lopdf's get_toc
+    // is documented in toc.rs to decode this; the test pins that behavior.
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-outline-utf16-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Synthesize a base PDF with an ASCII title, then patch the title bytes to UTF-16BE+BOM.
+    let bytes = synthesize_pdf_with_outline(2, &[(1, 1, "PLACEHOLDER")]);
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    // Reload via lopdf, find the outline item, replace its /Title with a UTF-16BE-encoded
+    // string for "Café", and re-save.
+    let mut doc = Document::load(&input_path).unwrap();
+    let object_ids: Vec<lopdf::ObjectId> = doc.objects.keys().copied().collect();
+    for id in object_ids {
+        if let Ok(dict) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
+            if dict.has(b"Title") && dict.has(b"Parent") {
+                // UTF-16BE BOM (0xFE 0xFF) followed by big-endian UTF-16 bytes for "Café".
+                let bytes: Vec<u8> = vec![
+                    0xFE, 0xFF, // BOM
+                    0x00, 0x43, // 'C'
+                    0x00, 0x61, // 'a'
+                    0x00, 0x66, // 'f'
+                    0x00, 0xE9, // 'é'
+                ];
+                dict.set("Title", Object::String(bytes, lopdf::StringFormat::Hexadecimal));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    std::fs::write(&input_path, &out).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    let entries = pdf.outline_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].title, "Café", "expected UTF-16BE decoded title, got {:?}", entries[0].title);
+}
+
+#[test]
+fn outline_entries_skips_out_of_range_pages() {
+    // Outline references page 99 in a 3-page document. The entry should be silently dropped.
+    let outline: Vec<(u32, u32, &str)> = vec![
+        (1, 1, "Real"),
+        (1, 99, "Out of range"),
+        (1, 3, "Also real"),
+    ];
+    let bytes = synthesize_pdf_with_outline(3, &outline);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-outline-oor-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    let entries = pdf.outline_entries();
+
+    // The "Out of range" entry should be dropped; the other two stay.
+    let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+    assert_eq!(titles, vec!["Real", "Also real"]);
 }
