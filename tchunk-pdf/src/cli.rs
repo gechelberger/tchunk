@@ -53,7 +53,7 @@ impl TokenizerKind {
 #[derive(Debug, Parser)]
 #[command(
     name = "tchunk-pdf",
-    about = "Split a PDF into smaller PDFs at page boundaries under a token budget.",
+    about = "Split a PDF into smaller PDFs along structural boundaries (chapter cuts by default) under a token budget.",
     version,
     group(
         ArgGroup::new("hf_source")
@@ -75,7 +75,7 @@ pub struct Cli {
     /// Coarsest level at which a split between chunks is allowed. Outline-based levels
     /// require the PDF to have a bookmarks tree;
     /// otherwise they fall back to `page` with a warning.
-    #[arg(short = 's', long, value_enum, default_value_t = SplitAt::Page)]
+    #[arg(short = 's', long, value_enum, default_value_t = SplitAt::Chapter)]
     pub split_at: SplitAt,
 
     /// Output directory (created if missing).

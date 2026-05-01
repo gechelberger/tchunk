@@ -275,6 +275,8 @@ fn cli_writes_index_sidecar_with_chunk_entries() {
         .arg(&out_dir)
         .arg("-t")
         .arg("word_count")
+        .arg("--split-at")
+        .arg("page")
         .status()
         .expect("spawn tchunk-pdf");
     assert!(status.success(), "binary exited non-zero: {status:?}");

@@ -1,6 +1,6 @@
 # tchunk-pdf
 
-Splits a PDF into smaller PDFs at page boundaries, each under a configurable token budget. Output PDFs preserve the original page content byte-for-byte (fonts, layout, embedded images) — pages are not re-rendered.
+Splits a PDF into smaller PDFs along structural boundaries — by default at chapter cuts from the PDF's outline, falling back to page boundaries if no outline is present — each under a configurable token budget. Pages are atomic; chunks are always whole-page subsets and the original page content is preserved byte-for-byte (fonts, layout, embedded images), not re-rendered.
 
 Built for prepping large PDFs (textbooks, legal codes, reference manuals) for upload to tools that cap source size, like NotebookLM.
 
@@ -26,14 +26,15 @@ tchunk-pdf <INPUT.pdf>... [OPTIONS]
 Common cases:
 
 ```sh
-# default: 500k token budget, splits at any page boundary, output beside CWD
+# default: 500k token budget, splits at chapter boundaries (falls back to page if the
+# PDF has no outline), output beside CWD
 tchunk-pdf my-book.pdf
 
 # tighter budget, write to a specific dir
 tchunk-pdf my-book.pdf -m 200000 -o ./out/
 
-# only break at chapter boundaries (requires PDF outline / bookmarks)
-tchunk-pdf my-book.pdf --split-at chapter
+# break anywhere on a page boundary (ignore the outline)
+tchunk-pdf my-book.pdf --split-at page
 
 # verbose: per-chunk page ranges and token totals
 tchunk-pdf my-book.pdf -v
@@ -54,7 +55,7 @@ files) — run `tchunk-pdf` once per file in that case.
 | Short | Long             | Default       | Description |
 |-------|------------------|---------------|-------------|
 | `-m`  | `--max-tokens`   | `500000`      | Target maximum tokens per output chunk. |
-| `-s`  | `--split-at`     | `page`        | Coarsest level a split is allowed at: `page`, `any-bookmark`, `subsection`, `section`, `chapter`. |
+| `-s`  | `--split-at`     | `chapter`     | Coarsest level a split is allowed at: `page`, `any-bookmark`, `subsection`, `section`, `chapter`. Outline-based levels fall back to `page` with a warning if the PDF has no bookmarks. |
 | `-o`  | `--output-dir`   | `.`           | Output directory (created if missing). |
 | `-p`  | `--prefix`       | input stem    | Output filename prefix. Rejected if more than one input is given. |
 | `-t`  | `--tokenizer`    | `word_count`  | `cl100k_base`, `o200k_base`, `word_count`, or `huggingface` (see [Tokenizers](#tokenizers)). |
@@ -106,7 +107,7 @@ Warning entries are tagged objects: `scan_like`, `image_dominant`, `outline_miss
 
 - **Page is atomic.** A page is never split mid-page; chunks are always whole-page subsets.
 - **Greedy packing** from the front of the document, with a **rebalance pass on the last two chunks** so a near-budget chunk isn't paired with a tiny remainder. Both halves of the rebalance stay under budget.
-- **Structural splits** via `--split-at chapter|section|subsection|any-bookmark` use the PDF outline (bookmarks). Outline depth maps to level: depth 1 → chapter, depth 2 → section, depth 3 → subsection, deeper → any-bookmark.
+- **Structural splits** are the default. `--split-at chapter` (the default), `section`, `subsection`, and `any-bookmark` all use the PDF outline (bookmarks). Outline depth maps to level: depth 1 → chapter, depth 2 → section, depth 3 → subsection, deeper → any-bookmark. Use `--split-at page` to ignore the outline and cut on any page boundary.
 - **Outline missing?** `--split-at` levels above `page` fall back to `page` with a stderr warning.
 - **Over-budget units recurse.** If a single unit (e.g. one chapter) exceeds `--max-tokens`, tchunk-pdf treats that unit as its own sub-problem and re-plans it at the next finer level (chapter → section → subsection → any-bookmark → page), balancing its sibling sub-chunks against each other rather than packing greedy-first-fit. Recursion falls through any level with no interior boundaries. Per-chunk `effective_level` in the index sidecar shows which level each chunk's cuts were actually taken at.
 - **Oversized pages.** A single page whose token count exceeds `--max-tokens` becomes its own output chunk with a warning.

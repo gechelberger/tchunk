@@ -4,7 +4,7 @@ Token-aware splitters for documents that need to be fed into tools (NotebookLM, 
 
 This is a Cargo workspace. Each member is a standalone CLI for a specific document type:
 
-- [`tchunk-pdf`](./tchunk-pdf) — splits a PDF into smaller PDFs at page boundaries, each under a token budget. Preserves original page content (fonts, layout, images).
+- [`tchunk-pdf`](./tchunk-pdf) — splits a PDF into smaller PDFs along structural boundaries (chapter cuts by default, configurable down to any page boundary), each under a token budget. Preserves original page content (fonts, layout, images).
 
 ## Quick start (PDF)
 
