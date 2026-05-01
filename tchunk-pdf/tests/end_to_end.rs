@@ -5,7 +5,7 @@ use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 
 use tchunk_pdf::pdf::Pdf;
-use tchunk_pdf::plan::{plan_chunks, BoundaryLevel};
+use tchunk_pdf::plan::{plan_chunks, Boundary, SplitAt};
 use tchunk_pdf::tokenize::{TiktokenTokenizer, Tokenizer};
 
 /// Build a synthetic N-page PDF where each page contains the text "Page <n>". Returns the bytes.
@@ -86,11 +86,11 @@ fn split_six_page_pdf_into_three_chunks_preserves_pages() {
         .iter()
         .map(|&n| tok.count(&pdf.page_text(n)))
         .collect();
-    let boundaries = vec![BoundaryLevel::Page; 6];
+    let boundaries = vec![Boundary::Page; 6];
 
     // Force multi-chunk: budget = roughly 2 pages worth.
     let budget = tokens.iter().sum::<usize>().div_ceil(3).max(1);
-    let plan = plan_chunks(&tokens, &boundaries, BoundaryLevel::Page, budget);
+    let plan = plan_chunks(&tokens, &boundaries, SplitAt::Page, budget);
 
     // Sum of chunk pages == input pages, each page appears exactly once, ordered.
     let flat: Vec<u32> = plan.chunks.iter().flat_map(|c| c.pages.clone()).collect();
@@ -145,9 +145,9 @@ fn single_chunk_when_budget_exceeds_total() {
         .iter()
         .map(|&n| tok.count(&pdf.page_text(n)))
         .collect();
-    let boundaries = vec![BoundaryLevel::Page; 3];
+    let boundaries = vec![Boundary::Page; 3];
 
-    let plan = plan_chunks(&tokens, &boundaries, BoundaryLevel::Page, 10_000);
+    let plan = plan_chunks(&tokens, &boundaries, SplitAt::Page, 10_000);
     assert_eq!(plan.chunks.len(), 1);
     assert_eq!(plan.chunks[0].pages, vec![1, 2, 3]);
 
