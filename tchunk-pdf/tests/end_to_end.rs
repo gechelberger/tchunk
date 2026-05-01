@@ -599,6 +599,8 @@ fn outline_entries_decodes_utf16be_bom_titles() {
                     0x00, 0x66, // 'f'
                     0x00, 0xE9, // 'é'
                 ];
+                // Hexadecimal survives lopdf's save/load roundtrip; Literal is the alternative
+                // per the design plan if a future lopdf version drops hex support.
                 dict.set("Title", Object::String(bytes, lopdf::StringFormat::Hexadecimal));
             }
         }
@@ -636,4 +638,6 @@ fn outline_entries_skips_out_of_range_pages() {
     // The "Out of range" entry should be dropped; the other two stay.
     let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
     assert_eq!(titles, vec!["Real", "Also real"]);
+    assert_eq!(entries[0].page, 1);
+    assert_eq!(entries[1].page, 3);
 }
