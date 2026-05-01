@@ -122,12 +122,10 @@ fn synthesize_pdf_with_outline(
         (0..outline.len()).map(|_| doc.new_object_id()).collect();
     let outlines_id = doc.new_object_id();
 
-    // Build parent/sibling/child references by walking entries with a depth stack.
-    // `parent_at_depth[d]` = item id of the most-recent open item at depth d (if any).
-    // `last_sibling_at_depth[d]` = item id of the most-recent item at depth d under the
-    //   current parent, used to wire /Next /Prev links.
+    // Build parent/child links by walking entries with a depth stack.
+    // `parent_at_depth[d]` = item id of the most-recent open item at depth d (if any);
+    //   read on the `else` branch below to locate the parent of each deeper entry.
     let mut parent_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
-    let mut last_sibling_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
     let mut first_child_of: std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId> =
         std::collections::HashMap::new();
     let mut last_child_of: std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId> =
@@ -143,7 +141,6 @@ fn synthesize_pdf_with_outline(
         // When we step shallower or to a sibling, clear deeper levels' state.
         for deeper in (d + 1)..parent_at_depth.len() {
             parent_at_depth[deeper] = None;
-            last_sibling_at_depth[deeper] = None;
         }
         // Record this item as the parent for any deeper items that follow.
         parent_at_depth[d] = Some(item_ids[i]);
@@ -161,7 +158,6 @@ fn synthesize_pdf_with_outline(
             first_child_of.entry(parent_id).or_insert(item_ids[i]);
             last_child_of.insert(parent_id, item_ids[i]);
         }
-        last_sibling_at_depth[d] = Some(item_ids[i]);
     }
 
     // Now build sibling /Next /Prev links via a second pass that, for each item, finds
