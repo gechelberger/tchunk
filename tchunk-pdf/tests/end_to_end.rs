@@ -65,6 +65,209 @@ fn synthesize_pdf(page_count: usize) -> Vec<u8> {
     out
 }
 
+/// Synthesize an N-page PDF with the given outline. Each outline entry is a
+/// `(depth, page_num, title)` triple. Depth is 1-based; entries must be given
+/// in document order. The function constructs the parent/child/sibling references
+/// of a valid PDF outline tree from this flat list.
+fn synthesize_pdf_with_outline(
+    page_count: usize,
+    outline: &[(u32, u32, &str)],
+) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+
+    let mut page_ids: Vec<Object> = Vec::with_capacity(page_count);
+    for i in 1..=page_count {
+        let text = format!("Page {i}");
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                Operation::new("Td", vec![100.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        page_ids.push(page_id.into());
+    }
+
+    let pages = dictionary! {
+        "Type" => "Pages",
+        "Kids" => page_ids.clone(),
+        "Count" => page_count as i64,
+        "Resources" => resources_id,
+        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+    };
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+    // Reserve object IDs for each outline item up front so /First /Last /Next /Prev /Parent
+    // references can use them before the items themselves exist.
+    let item_ids: Vec<lopdf::ObjectId> =
+        (0..outline.len()).map(|_| doc.new_object_id()).collect();
+    let outlines_id = doc.new_object_id();
+
+    // Build parent/sibling/child references by walking entries with a depth stack.
+    // `parent_at_depth[d]` = item id of the most-recent open item at depth d (if any).
+    // `last_sibling_at_depth[d]` = item id of the most-recent item at depth d under the
+    //   current parent, used to wire /Next /Prev links.
+    let mut parent_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
+    let mut last_sibling_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
+    let mut first_child_of: std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId> =
+        std::collections::HashMap::new();
+    let mut last_child_of: std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId> =
+        std::collections::HashMap::new();
+    let mut child_count_of: std::collections::HashMap<lopdf::ObjectId, i64> =
+        std::collections::HashMap::new();
+    let mut top_level_count: i64 = 0;
+    let mut top_level_first: Option<lopdf::ObjectId> = None;
+    let mut top_level_last: Option<lopdf::ObjectId> = None;
+
+    for (i, &(depth, _page, _title)) in outline.iter().enumerate() {
+        let d = depth as usize;
+        // When we step shallower or to a sibling, clear deeper levels' state.
+        for deeper in (d + 1)..parent_at_depth.len() {
+            parent_at_depth[deeper] = None;
+            last_sibling_at_depth[deeper] = None;
+        }
+        // Record this item as the parent for any deeper items that follow.
+        parent_at_depth[d] = Some(item_ids[i]);
+
+        // Wire as sibling under current parent.
+        let parent_id = if d == 1 { outlines_id } else { parent_at_depth[d - 1].expect("orphan outline entry: depth > 1 with no parent at depth-1") };
+        if d == 1 {
+            top_level_count += 1;
+            if top_level_first.is_none() {
+                top_level_first = Some(item_ids[i]);
+            }
+            top_level_last = Some(item_ids[i]);
+        } else {
+            *child_count_of.entry(parent_id).or_insert(0) += 1;
+            first_child_of.entry(parent_id).or_insert(item_ids[i]);
+            last_child_of.insert(parent_id, item_ids[i]);
+        }
+        last_sibling_at_depth[d] = Some(item_ids[i]);
+    }
+
+    // Now build sibling /Next /Prev links via a second pass that, for each item, finds
+    // its previous sibling and next sibling under the same parent.
+    let mut prev_sibling: Vec<Option<lopdf::ObjectId>> = vec![None; outline.len()];
+    let mut next_sibling: Vec<Option<lopdf::ObjectId>> = vec![None; outline.len()];
+    {
+        // For each parent (including outlines_id for top-level), collect children in order
+        // and link them.
+        let mut children_of: std::collections::HashMap<lopdf::ObjectId, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut local_parent_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
+        for (i, &(depth, _page, _title)) in outline.iter().enumerate() {
+            let d = depth as usize;
+            for deeper in (d + 1)..local_parent_at_depth.len() {
+                local_parent_at_depth[deeper] = None;
+            }
+            let parent_id = if d == 1 { outlines_id } else { local_parent_at_depth[d - 1].expect("orphan") };
+            children_of.entry(parent_id).or_default().push(i);
+            local_parent_at_depth[d] = Some(item_ids[i]);
+        }
+        for siblings in children_of.values() {
+            for w in siblings.windows(2) {
+                next_sibling[w[0]] = Some(item_ids[w[1]]);
+                prev_sibling[w[1]] = Some(item_ids[w[0]]);
+            }
+        }
+    }
+
+    // Emit each outline item dictionary at its reserved ID.
+    for (i, &(depth, page, title)) in outline.iter().enumerate() {
+        let d = depth as usize;
+        let parent_id = if d == 1 {
+            outlines_id
+        } else {
+            // The parent at depth d-1 captured during the first pass. Re-derive it here
+            // by scanning backwards for the closest entry at depth d-1.
+            let mut p: Option<lopdf::ObjectId> = None;
+            for j in (0..i).rev() {
+                if outline[j].0 == depth - 1 {
+                    p = Some(item_ids[j]);
+                    break;
+                }
+                if outline[j].0 < depth - 1 {
+                    panic!("orphan outline entry at index {i}: jumped from depth {} to {}", outline[j].0, depth);
+                }
+            }
+            p.expect("no parent found for non-top-level outline entry")
+        };
+        let page_ref = if (page as usize) >= 1 && (page as usize) <= page_count {
+            page_ids[(page - 1) as usize].clone()
+        } else {
+            // Out-of-range: emit a literal page number that won't resolve. lopdf's
+            // resolve_page handles Object::Integer too, so we use a literal integer
+            // beyond the range to force a skip.
+            Object::Integer((page as i64) - 1) // 0-based for Integer destinations
+        };
+        let mut item = dictionary! {
+            "Title" => Object::string_literal(title),
+            "Parent" => Object::Reference(parent_id),
+            "Dest" => Object::Array(vec![
+                page_ref,
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        };
+        if let Some(p) = prev_sibling[i] {
+            item.set("Prev", Object::Reference(p));
+        }
+        if let Some(n) = next_sibling[i] {
+            item.set("Next", Object::Reference(n));
+        }
+        if let Some(&fc) = first_child_of.get(&item_ids[i]) {
+            item.set("First", Object::Reference(fc));
+            item.set("Last", Object::Reference(*last_child_of.get(&item_ids[i]).unwrap()));
+            item.set("Count", *child_count_of.get(&item_ids[i]).unwrap_or(&0));
+        }
+        doc.objects.insert(item_ids[i], Object::Dictionary(item));
+    }
+
+    // Emit the root /Outlines dictionary.
+    let mut outlines_dict = dictionary! {
+        "Type" => "Outlines",
+        "Count" => top_level_count,
+    };
+    if let Some(f) = top_level_first {
+        outlines_dict.set("First", Object::Reference(f));
+    }
+    if let Some(l) = top_level_last {
+        outlines_dict.set("Last", Object::Reference(l));
+    }
+    doc.objects.insert(outlines_id, Object::Dictionary(outlines_dict));
+
+    // Catalog references both /Pages and /Outlines.
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "Outlines" => Object::Reference(outlines_id),
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.compress();
+
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("save_to memory buffer");
+    out
+}
+
 #[test]
 fn split_six_page_pdf_into_three_chunks_preserves_pages() {
     // 6-page synthetic PDF, ~5 tokens per page. Budget 10 -> roughly 3 chunks.
@@ -329,4 +532,36 @@ fn outline_entries_empty_when_no_outline() {
 
     let pdf = Pdf::load(&input_path).expect("load");
     assert!(pdf.outline_entries().is_empty(), "expected empty Vec for outlineless PDF");
+}
+
+#[test]
+fn outline_entries_in_document_order() {
+    let outline: Vec<(u32, u32, &str)> = vec![
+        (1, 1, "Chapter 1"),
+        (2, 2, "Section 1.1"),
+        (2, 3, "Section 1.2"),
+        (1, 4, "Chapter 2"),
+        (2, 5, "Section 2.1"),
+    ];
+    let bytes = synthesize_pdf_with_outline(5, &outline);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-outline-order-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    let entries = pdf.outline_entries();
+
+    let expected: Vec<OutlineEntry> = outline
+        .iter()
+        .map(|&(d, p, t)| OutlineEntry {
+            depth: d,
+            page: p,
+            title: t.to_string(),
+        })
+        .collect();
+    assert_eq!(entries, expected);
 }

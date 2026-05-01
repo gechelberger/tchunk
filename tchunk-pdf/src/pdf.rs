@@ -175,7 +175,19 @@ impl Pdf {
     /// Returns an empty `Vec` when the PDF has no outline. Entries whose destination
     /// resolves outside the document's page range are skipped silently.
     pub fn outline_entries(&self) -> Vec<OutlineEntry> {
-        Vec::new()
+        let toc = match self.doc.get_toc() {
+            Ok(toc) => toc,
+            Err(_) => return Vec::new(),
+        };
+        toc.toc
+            .into_iter()
+            .filter(|t| t.page >= 1 && t.page <= self.pages.len())
+            .map(|t| OutlineEntry {
+                depth: t.level as u32,
+                page: t.page as u32,
+                title: t.title,
+            })
+            .collect()
     }
 
     /// Write a new PDF containing only the given 1-based page numbers, preserving original page
