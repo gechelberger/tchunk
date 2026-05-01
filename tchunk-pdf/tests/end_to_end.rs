@@ -4,7 +4,7 @@ use std::process::Command;
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 
-use tchunk_pdf::pdf::Pdf;
+use tchunk_pdf::pdf::{OutlineEntry, Pdf};
 use tchunk_pdf::plan::{plan_chunks, Boundary, SplitAt};
 use tchunk_pdf::tokenize::{TiktokenTokenizer, Tokenizer};
 
@@ -314,4 +314,19 @@ fn cli_writes_index_sidecar_with_chunk_entries() {
         expected_next = end + 1;
     }
     assert_eq!(expected_next, 7, "chunks did not cover all 6 pages");
+}
+
+#[test]
+fn outline_entries_empty_when_no_outline() {
+    let bytes = synthesize_pdf(3);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-outline-empty-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    assert!(pdf.outline_entries().is_empty(), "expected empty Vec for outlineless PDF");
 }
