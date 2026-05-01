@@ -187,11 +187,18 @@ fn subset_to_pages(
         .and_then(Object::as_reference)
         .map_err(|e| anyhow!("missing /Pages in catalog: {e}"))?;
 
-    // Repoint each kept page directly at the pages root, in case the original tree had
-    // intermediate Pages nodes that we're about to discard.
+    // Repoint each kept page directly at the pages root, and strip per-page entries that may
+    // reach pages outside the kept set: /Annots can carry GoTo links to dropped pages,
+    // /B references article-thread beads, /AA carries open/close actions. Without removal,
+    // prune_objects keeps those targets alive (bloating the chunk) and the chunk PDF retains
+    // dangling refs. We accept losing intra-chunk hyperlinks and URL annotations here —
+    // chunk PDFs are for downstream tokenized processing, not reading.
     for &page_id in &kept_ids {
         if let Ok(page_dict) = doc.get_object_mut(page_id).and_then(Object::as_dict_mut) {
             page_dict.set("Parent", Object::Reference(pages_root_id));
+            page_dict.remove(b"Annots");
+            page_dict.remove(b"B");
+            page_dict.remove(b"AA");
         }
     }
 
@@ -205,13 +212,20 @@ fn subset_to_pages(
         return Err(anyhow!("/Pages object is not a dictionary"));
     }
 
-    // Drop the catalog's outline tree and named-destination tables — they reference pages we're
-    // dropping, and chunk-level navigation isn't useful anyway.
+    // Drop catalog entries that reference pages or document-wide interactive structure.
+    // Anything reachable through these would survive prune_objects, keeping dropped pages
+    // alive in the chunk and leaving stale refs (e.g. an OpenAction targeting a missing page).
     if let Ok(catalog_dict) = doc.get_object_mut(catalog_id).and_then(Object::as_dict_mut) {
         catalog_dict.remove(b"Outlines");
         catalog_dict.remove(b"Names");
         catalog_dict.remove(b"Dests");
         catalog_dict.remove(b"PageLabels");
+        catalog_dict.remove(b"OpenAction");
+        catalog_dict.remove(b"AA");
+        catalog_dict.remove(b"AcroForm");
+        catalog_dict.remove(b"StructTreeRoot");
+        catalog_dict.remove(b"MarkInfo");
+        catalog_dict.remove(b"Threads");
     }
 
     // Single-pass GC of everything no longer reachable from the trailer.

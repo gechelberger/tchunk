@@ -157,6 +157,103 @@ fn single_chunk_when_budget_exceeds_total() {
     assert_eq!(reloaded.page_count(), 3);
 }
 
+/// Build a synthetic 6-page PDF whose catalog has an `/OpenAction` targeting page 5. Used to
+/// verify that subsetting drops the catalog action so a dropped page can't survive in the chunk
+/// via `prune_objects` reachability.
+fn synthesize_pdf_with_open_action(page_count: usize, target_page: usize) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+
+    let mut page_ids: Vec<Object> = Vec::with_capacity(page_count);
+    for i in 1..=page_count {
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                Operation::new("Td", vec![100.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal(format!("Page {i}"))]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+        });
+        page_ids.push(page_id.into());
+    }
+
+    let target_page_id = match &page_ids[target_page - 1] {
+        Object::Reference(id) => *id,
+        _ => unreachable!("page_ids contains References"),
+    };
+
+    let pages = dictionary! {
+        "Type" => "Pages",
+        "Kids" => page_ids,
+        "Count" => page_count as i64,
+        "Resources" => resources_id,
+        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+    };
+    doc.objects.insert(pages_id, Object::Dictionary(pages));
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "OpenAction" => vec![Object::Reference(target_page_id), "Fit".into()],
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.compress();
+
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("save_to memory buffer");
+    out
+}
+
+#[test]
+fn subset_strips_catalog_open_action_referencing_dropped_page() {
+    let bytes = synthesize_pdf_with_open_action(6, 5);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-catalog-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    assert_eq!(pdf.page_count(), 6);
+
+    let out_path = dir.join("chunk.pdf");
+    pdf.write_chunk(&[1, 2], &out_path).expect("write_chunk");
+
+    let out_doc = Document::load(&out_path).expect("reload chunk");
+    let catalog_id = out_doc
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .expect("catalog ref in trailer");
+    let catalog = out_doc.get_dictionary(catalog_id).expect("catalog dict");
+    assert!(
+        catalog.get(b"OpenAction").is_err(),
+        "catalog still carries /OpenAction after subset"
+    );
+
+    let pages = out_doc.get_pages();
+    assert_eq!(pages.len(), 2, "expected 2 pages in chunk, got {}", pages.len());
+}
+
 #[test]
 fn cli_writes_index_sidecar_with_chunk_entries() {
     let bytes = synthesize_pdf(6);
