@@ -41,6 +41,70 @@ impl BoundaryLevel {
     }
 }
 
+/// Per-page outline data. Records the actual outline depth, with no level-name mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Boundary {
+    Page,
+    Bookmark { depth: u32 },
+}
+
+impl Boundary {
+    pub fn as_str(self) -> String {
+        match self {
+            Boundary::Page => "page".to_string(),
+            Boundary::Bookmark { depth } => format!("depth-{depth}"),
+        }
+    }
+}
+
+/// What the user (or recursion) is splitting at. Named CLI flags resolve to specific
+/// `SplitAt` values in `cli.rs`; everywhere else in the codebase works directly in
+/// depth-space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitAt {
+    Page,
+    AnyBookmark,
+    Depth(u32),
+}
+
+impl SplitAt {
+    /// True if `b` is a valid cut point at this split level.
+    /// `Page` matches no `Boundary` directly — it is special-cased upstream
+    /// (every page is its own unit), so this method panics on `SplitAt::Page` to surface
+    /// any caller that forgot to special-case it.
+    pub fn matches(&self, b: &Boundary) -> bool {
+        match (self, b) {
+            (SplitAt::Page, _) => unreachable!("SplitAt::Page is special-cased upstream"),
+            (SplitAt::AnyBookmark, Boundary::Bookmark { .. }) => true,
+            (SplitAt::AnyBookmark, Boundary::Page) => false,
+            (SplitAt::Depth(n), Boundary::Bookmark { depth }) => depth <= n,
+            (SplitAt::Depth(_), Boundary::Page) => false,
+        }
+    }
+
+    pub fn as_str(self) -> String {
+        match self {
+            SplitAt::Page => "page".to_string(),
+            SplitAt::AnyBookmark => "any-bookmark".to_string(),
+            SplitAt::Depth(n) => format!("depth-{n}"),
+        }
+    }
+
+    /// Rank this split-level on a coarsest→finest axis. Used by `main.rs` to pick the
+    /// finest level used across chunks for the `split_at_effective` sidecar field.
+    /// Larger return value = finer.
+    ///   `Depth(N)` → `(0, N)` — coarsest, ordered by depth.
+    ///   `AnyBookmark` → `(1, 0)` — finer than any specific `Depth`.
+    ///   `Page` → `(2, 0)` — finest.
+    pub fn finest_rank(self) -> (u8, u32) {
+        match self {
+            SplitAt::Depth(n) => (0, n),
+            SplitAt::AnyBookmark => (1, 0),
+            SplitAt::Page => (2, 0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Diagnostic {
     OversizedPage { page: u32, tokens: usize },
@@ -782,5 +846,73 @@ mod tests {
             next_effective_level(&b, 0..3, BoundaryLevel::Chapter),
             BoundaryLevel::Section
         );
+    }
+
+    #[test]
+    fn boundary_as_str_renders_depth() {
+        assert_eq!(Boundary::Page.as_str(), "page");
+        assert_eq!(Boundary::Bookmark { depth: 1 }.as_str(), "depth-1");
+        assert_eq!(Boundary::Bookmark { depth: 7 }.as_str(), "depth-7");
+    }
+
+    #[test]
+    fn splitat_as_str_covers_all_variants() {
+        assert_eq!(SplitAt::Page.as_str(), "page");
+        assert_eq!(SplitAt::AnyBookmark.as_str(), "any-bookmark");
+        assert_eq!(SplitAt::Depth(1).as_str(), "depth-1");
+        assert_eq!(SplitAt::Depth(42).as_str(), "depth-42");
+    }
+
+    #[test]
+    fn splitat_matches_depth_threshold() {
+        let any_b = SplitAt::AnyBookmark;
+        let d1 = SplitAt::Depth(1);
+        let d2 = SplitAt::Depth(2);
+        let page = Boundary::Page;
+        let b1 = Boundary::Bookmark { depth: 1 };
+        let b2 = Boundary::Bookmark { depth: 2 };
+        let b3 = Boundary::Bookmark { depth: 3 };
+
+        // AnyBookmark matches every Bookmark, never Page.
+        assert!(any_b.matches(&b1));
+        assert!(any_b.matches(&b3));
+        assert!(!any_b.matches(&page));
+
+        // Depth(N) matches Bookmark{depth} where depth <= N.
+        assert!(d1.matches(&b1));
+        assert!(!d1.matches(&b2));
+        assert!(d2.matches(&b1));
+        assert!(d2.matches(&b2));
+        assert!(!d2.matches(&b3));
+        assert!(!d1.matches(&page));
+    }
+
+    #[test]
+    #[should_panic]
+    fn splitat_page_matches_panics_to_catch_misuse() {
+        // Page is special-cased upstream; callers must not invoke matches() on it.
+        let _ = SplitAt::Page.matches(&Boundary::Page);
+    }
+
+    #[test]
+    fn finest_rank_orders_coarse_to_fine() {
+        use std::cmp::Ordering;
+        let pairs = [
+            (SplitAt::Depth(1), SplitAt::Depth(2), Ordering::Less),
+            (SplitAt::Depth(2), SplitAt::Depth(1), Ordering::Greater),
+            (SplitAt::Depth(5), SplitAt::AnyBookmark, Ordering::Less),
+            (SplitAt::AnyBookmark, SplitAt::Depth(99), Ordering::Greater),
+            (SplitAt::AnyBookmark, SplitAt::Page, Ordering::Less),
+            (SplitAt::Page, SplitAt::Depth(1), Ordering::Greater),
+        ];
+        for (a, b, want) in pairs {
+            assert_eq!(
+                a.finest_rank().cmp(&b.finest_rank()),
+                want,
+                "{:?} vs {:?}",
+                a,
+                b
+            );
+        }
     }
 }
