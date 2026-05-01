@@ -110,4 +110,62 @@ mod tests {
 ";
         assert_eq!(got, expected, "got:\n{got}\nexpected:\n{expected}");
     }
+
+    #[test]
+    fn print_histogram_singular_grammar() {
+        // Single bookmark at depth 1 in a 1-page doc → "1 bookmark", "1 segment", "1 page long".
+        let entries = vec![OutlineEntry { depth: 1, page: 1, title: "Only".into() }];
+        let mut buf = Vec::new();
+        print_histogram(&mut buf, &entries, 1).unwrap();
+        let got = String::from_utf8(buf).unwrap();
+        let expected = "\
+1 pages, 1 bookmark, max depth 1
+  at depth 1: 1 bookmark  → 1 segment, 1 page long
+";
+        assert_eq!(got, expected, "got:\n{got}\nexpected:\n{expected}");
+    }
+
+    #[test]
+    fn print_histogram_min_eq_max_collapse() {
+        // Three depth-1 entries at pages 1, 4, 7 in a 9-page doc.
+        // Cut points: [1, 4, 7]. Segments: [1-3, 4-6, 7-9] = 3 pages each.
+        let entries = vec![
+            OutlineEntry { depth: 1, page: 1, title: "A".into() },
+            OutlineEntry { depth: 1, page: 4, title: "B".into() },
+            OutlineEntry { depth: 1, page: 7, title: "C".into() },
+        ];
+        let mut buf = Vec::new();
+        print_histogram(&mut buf, &entries, 9).unwrap();
+        let got = String::from_utf8(buf).unwrap();
+        let expected = "\
+9 pages, 3 bookmarks, max depth 1
+  at depth 1: 3 bookmarks  → 3 segments, 3 pages long
+";
+        assert_eq!(got, expected, "got:\n{got}\nexpected:\n{expected}");
+    }
+
+    #[test]
+    fn print_histogram_includes_zero_count_rows() {
+        // Outline has depth-1 and depth-3 entries but no depth-2 entries.
+        // Expect a depth-2 row with "0 bookmarks" and segment count = cumulative through depth-2,
+        // which equals depth-1 count since no new cuts are added at depth-2.
+        let entries = vec![
+            OutlineEntry { depth: 1, page: 1, title: "A".into() },
+            OutlineEntry { depth: 3, page: 5, title: "A.1.1".into() },
+            OutlineEntry { depth: 1, page: 10, title: "B".into() },
+        ];
+        let mut buf = Vec::new();
+        print_histogram(&mut buf, &entries, 20).unwrap();
+        let got = String::from_utf8(buf).unwrap();
+        // Depth 1: 2 entries → cuts [1, 10] → segments of 9 and 11 pages
+        // Depth 2: 0 entries → cumulative still 2 segments, same spans 9-11
+        // Depth 3: 1 entry → cuts [1, 5, 10] → spans [4, 5, 11]
+        let expected = "\
+20 pages, 3 bookmarks, max depth 3
+  at depth 1: 2 bookmarks  → 2 segments, 9-11 pages long
+  at depth 2: 0 bookmarks  → 2 segments, 9-11 pages long
+  at depth 3: 1 bookmark  → 3 segments, 4-11 pages long
+";
+        assert_eq!(got, expected, "got:\n{got}\nexpected:\n{expected}");
+    }
 }
