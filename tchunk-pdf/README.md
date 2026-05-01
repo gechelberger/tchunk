@@ -55,7 +55,8 @@ files) — run `tchunk-pdf` once per file in that case.
 | Short | Long             | Default       | Description |
 |-------|------------------|---------------|-------------|
 | `-m`  | `--max-tokens`   | `500000`      | Target maximum tokens per output chunk. |
-| `-s`  | `--split-at`     | `chapter`     | Coarsest level a split is allowed at: `page`, `any-bookmark`, `subsection`, `section`, `chapter`. Outline-based levels fall back to `page` with a warning if the PDF has no bookmarks. |
+| `-s`  | `--split-at`     | `chapter`     | Coarsest level a split is allowed at: `page`, `any-bookmark`, `subsection`, `section`, `chapter`. Named flags are sugar for specific outline depths (`chapter`=1, `section`=2, `subsection`=3); `any-bookmark` matches any depth. Outline-based levels fall back to `page` with a warning if the PDF has no bookmarks. Mutually exclusive with `--split-at-depth`. |
+|       | `--split-at-depth` | —           | Split at a specific outline depth (e.g. `--split-at-depth 4` for outlines deeper than the named flags reach). Mutually exclusive with `--split-at`. |
 | `-o`  | `--output-dir`   | `.`           | Output directory (created if missing). |
 | `-p`  | `--prefix`       | input stem    | Output filename prefix. Rejected if more than one input is given. |
 | `-t`  | `--tokenizer`    | `word_count`  | `cl100k_base`, `o200k_base`, `word_count`, or `huggingface` (see [Tokenizers](#tokenizers)). |
@@ -87,19 +88,19 @@ Alongside the PDFs, a JSON sidecar is written at `{prefix}.index.json` describin
   "config": {
     "tokenizer": "o200k_base",
     "max_tokens": 500000,
-    "split_at_requested": "chapter",
-    "split_at_effective": "section"
+    "split_at_requested": "depth-1",
+    "split_at_effective": "depth-2"
   },
   "chunks": [
-    { "filename": "my-book_001.pdf", "pages": { "start": 1, "end": 112, "count": 112 }, "token_count": 487234, "effective_level": "chapter" },
-    { "filename": "my-book_002.pdf", "pages": { "start": 113, "end": 220, "count": 108 }, "token_count": 441200, "effective_level": "section" },
-    { "filename": "my-book_003.pdf", "pages": { "start": 221, "end": 320, "count": 100 }, "token_count": 412118, "effective_level": "section" }
+    { "filename": "my-book_001.pdf", "pages": { "start": 1, "end": 112, "count": 112 }, "token_count": 487234, "effective_level": "depth-1" },
+    { "filename": "my-book_002.pdf", "pages": { "start": 113, "end": 220, "count": 108 }, "token_count": 441200, "effective_level": "depth-2" },
+    { "filename": "my-book_003.pdf", "pages": { "start": 221, "end": 320, "count": 100 }, "token_count": 412118, "effective_level": "depth-2" }
   ],
   "warnings": []
 }
 ```
 
-`split_at_effective` is the *finest* level actually used across chunks (the worst-case view of how far recursion had to descend). `effective_level` on each chunk is the level at which *that chunk's* adjacent cuts were taken — for chunks that fit cleanly at the requested level it matches the request; for chunks produced by recursing into an over-budget unit it shows the finer level the recursion landed on.
+`split_at_effective` is the *finest* level actually used across chunks (the worst-case view of how far recursion had to descend). `effective_level` on each chunk is the level at which *that chunk's* adjacent cuts were taken — for chunks that fit cleanly at the requested level it matches the request; for chunks produced by recursing into an over-budget unit it shows the finer level the recursion landed on. Both fields use the canonical depth strings (`"page"`, `"any-bookmark"`, or `"depth-N"`); the named CLI flags (`chapter`, `section`, `subsection`) are sugar for specific depths on input only and don't round-trip into the sidecar.
 
 Warning entries are tagged objects: `scan_like`, `image_dominant`, `outline_missing`, `oversized_page`. The same warnings are still printed to stderr; the sidecar just makes them machine-readable.
 
@@ -107,9 +108,9 @@ Warning entries are tagged objects: `scan_like`, `image_dominant`, `outline_miss
 
 - **Page is atomic.** A page is never split mid-page; chunks are always whole-page subsets.
 - **Greedy packing** from the front of the document, with a **rebalance pass on the last two chunks** so a near-budget chunk isn't paired with a tiny remainder. Both halves of the rebalance stay under budget.
-- **Structural splits** are the default. `--split-at chapter` (the default), `section`, `subsection`, and `any-bookmark` all use the PDF outline (bookmarks). Outline depth maps to level: depth 1 → chapter, depth 2 → section, depth 3 → subsection, deeper → any-bookmark. Use `--split-at page` to ignore the outline and cut on any page boundary.
+- **Structural splits** are the default. `--split-at chapter` (the default), `section`, `subsection`, and `any-bookmark` all use the PDF outline (bookmarks). Named flags map to specific outline depths: `chapter`=1, `section`=2, `subsection`=3. `any-bookmark` matches every outline entry regardless of depth. For outlines whose top level isn't called "chapter" (e.g. Parts/Chapters books, where chapters are at depth 2), use `--split-at-depth N` to target the actual depth. Use `--split-at page` to ignore the outline entirely.
 - **Outline missing?** `--split-at` levels above `page` fall back to `page` with a stderr warning.
-- **Over-budget units recurse.** If a single unit (e.g. one chapter) exceeds `--max-tokens`, tchunk-pdf treats that unit as its own sub-problem and re-plans it at the next finer level (chapter → section → subsection → any-bookmark → page), balancing its sibling sub-chunks against each other rather than packing greedy-first-fit. Recursion falls through any level with no interior boundaries. Per-chunk `effective_level` in the index sidecar shows which level each chunk's cuts were actually taken at.
+- **Over-budget units recurse.** If a single unit (e.g. one chapter) exceeds `--max-tokens`, tchunk-pdf treats that unit as its own sub-problem and re-plans it at the next finer outline depth (depth-1 → depth-2 → depth-3 → ... → page), balancing its sibling sub-chunks against each other rather than packing greedy-first-fit. Recursion falls through any depth with no interior boundaries. Per-chunk `effective_level` in the index sidecar shows which depth each chunk's cuts were actually taken at.
 - **Oversized pages.** A single page whose token count exceeds `--max-tokens` becomes its own output chunk with a warning.
 
 ## Tokenizers
