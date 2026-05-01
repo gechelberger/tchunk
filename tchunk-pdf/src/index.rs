@@ -3,8 +3,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::plan::BoundaryLevel;
-
 #[derive(Serialize)]
 pub struct Index {
     pub tool: &'static str,
@@ -63,16 +61,6 @@ pub enum Warning {
         pages_affected: usize,
         total_pages: usize,
     },
-}
-
-pub fn boundary_level_str(l: BoundaryLevel) -> &'static str {
-    match l {
-        BoundaryLevel::Page => "page",
-        BoundaryLevel::AnyBookmark => "any-bookmark",
-        BoundaryLevel::Subsection => "subsection",
-        BoundaryLevel::Section => "section",
-        BoundaryLevel::Chapter => "chapter",
-    }
 }
 
 impl Index {

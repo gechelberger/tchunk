@@ -30,6 +30,10 @@ impl Pdf {
     }
 
     /// Extracted text for a single 1-based page number. Missing or errored pages return `""`.
+    ///
+    /// Uses `lopdf::Document::extract_text` on the already-parsed Document (no second PDF parse),
+    /// which is much faster than `pdf-extract` on large files. Quality is lower than pdf-extract,
+    /// but we only use this for token *counting* — approximate is fine.
     pub fn page_text(&self, page_num: u32) -> String {
         self.doc.extract_text(&[page_num]).unwrap_or_default()
     }
@@ -40,27 +44,6 @@ impl Pdf {
             Some(&page_id) => self.count_images_on_page(page_id),
             None => 0,
         }
-    }
-
-    /// Per-page text. Returns one String per page (length == page_count).
-    ///
-    /// Uses `lopdf::Document::extract_text` on the already-parsed Document (no second PDF parse),
-    /// which is much faster than `pdf-extract` on large files. Quality is lower than pdf-extract,
-    /// but we only use this for token *counting* — approximate is fine. Per-page failures yield
-    /// empty strings (will look like a near-empty page to the scan-like warning).
-    pub fn page_texts(&self) -> Vec<String> {
-        self.pages
-            .keys()
-            .map(|&n| self.page_text(n))
-            .collect()
-    }
-
-    /// Number of `/Subtype /Image` XObjects referenced by each page (1-based indexed).
-    pub fn image_counts(&self) -> Vec<usize> {
-        self.pages
-            .values()
-            .map(|&id| self.count_images_on_page(id))
-            .collect()
     }
 
     fn count_images_on_page(&self, page_id: ObjectId) -> usize {

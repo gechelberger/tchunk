@@ -1,5 +1,4 @@
 use std::ops::Range;
-use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BoundaryLevel {
@@ -30,20 +29,14 @@ impl BoundaryLevel {
             BoundaryLevel::Page => None,
         }
     }
-}
 
-impl FromStr for BoundaryLevel {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "page" => Ok(BoundaryLevel::Page),
-            "any-bookmark" | "bookmark" => Ok(BoundaryLevel::AnyBookmark),
-            "subsection" => Ok(BoundaryLevel::Subsection),
-            "section" => Ok(BoundaryLevel::Section),
-            "chapter" => Ok(BoundaryLevel::Chapter),
-            other => Err(format!(
-                "unknown split level '{other}' (expected: page | any-bookmark | subsection | section | chapter)"
-            )),
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BoundaryLevel::Page => "page",
+            BoundaryLevel::AnyBookmark => "any-bookmark",
+            BoundaryLevel::Subsection => "subsection",
+            BoundaryLevel::Section => "section",
+            BoundaryLevel::Chapter => "chapter",
         }
     }
 }
@@ -80,24 +73,28 @@ pub fn plan_chunks(
     }
 
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    let mut chunks = pack_top_level(tokens, boundaries, split_at, budget, &mut diagnostics);
+    let mut chunks = greedy_pack(tokens, boundaries, 0..tokens.len(), split_at, budget, &mut diagnostics);
     rebalance_last_two(&mut chunks, tokens, boundaries, split_at, budget);
     PlanResult { chunks, diagnostics }
 }
 
-/// Top-level greedy-pack over units at `split_at`. On unit overrun, hand off to `plan_overrun`
-/// which re-plans that unit at the next finer effective level with equal-target + pairwise
-/// rebalance. Preserves original greedy-at-top-level + final last-two-rebalance semantics for
-/// documents with no overruns.
-fn pack_top_level(
+/// Budget-greedy pack over the units that `segment_units` produces from `range` at `split_at`.
+/// On unit overrun, hand off to `plan_overrun` which re-plans that unit at the next finer level.
+///
+/// Budget-greedy (rather than equal-target) is important: it keeps the invariant that no two
+/// adjacent output chunks can be combined under budget, because a flush only happens when the
+/// next unit would overflow. Equal-target packing broke that invariant — the hysteresis check
+/// would fire partway through the remainder and leave two small neighbor chunks that obviously
+/// should have been one.
+fn greedy_pack(
     tokens: &[usize],
     boundaries: &[BoundaryLevel],
+    range: Range<usize>,
     split_at: BoundaryLevel,
     budget: usize,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<PlannedChunk> {
-    let n = tokens.len();
-    let units = segment_units(boundaries, 0..n, split_at);
+    let units = segment_units(boundaries, range, split_at);
 
     let mut chunks: Vec<PlannedChunk> = Vec::new();
     let mut cur: Vec<Range<usize>> = Vec::new();
@@ -124,15 +121,10 @@ fn pack_top_level(
     chunks
 }
 
-/// Plan an over-budget page range at `split_at`, using budget-greedy packing over sub-units and
-/// recursing into any sub-unit that still overruns. Finishes with a pairwise-sweep rebalance
-/// across sibling sub-chunks to redistribute tokens toward equal sizes.
-///
-/// Budget-greedy (rather than equal-target) is important: it keeps the invariant that no two
-/// adjacent output chunks can be combined under budget, because a flush only happens when the
-/// next unit would overflow. Equal-target packing broke that invariant — the hysteresis check
-/// would fire partway through the remainder and leave two small neighbor chunks that obviously
-/// should have been one.
+/// Re-plan an over-budget unit at a finer level. Same packing as the top level, but follows up
+/// with a pairwise-sweep rebalance so siblings of a recursed unit redistribute toward equal
+/// sizes. Page-level bottoms out in `pack_pages_balanced`, which adds the oversized-page
+/// diagnostic.
 fn plan_overrun(
     tokens: &[usize],
     boundaries: &[BoundaryLevel],
@@ -144,32 +136,7 @@ fn plan_overrun(
     if split_at == BoundaryLevel::Page {
         return pack_pages_balanced(tokens, boundaries, range, budget, diagnostics);
     }
-
-    let units = segment_units(boundaries, range, split_at);
-
-    let mut chunks: Vec<PlannedChunk> = Vec::new();
-    let mut cur: Vec<Range<usize>> = Vec::new();
-    let mut cur_tokens: usize = 0;
-
-    for unit in units {
-        let unit_tokens = sum_tokens(tokens, &unit);
-
-        if unit_tokens > budget {
-            flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
-            let finer = next_effective_level(boundaries, unit.clone(), split_at);
-            let sub = plan_overrun(tokens, boundaries, unit, finer, budget, diagnostics);
-            chunks.extend(sub);
-            continue;
-        }
-
-        if cur_tokens + unit_tokens > budget {
-            flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
-        }
-        cur_tokens += unit_tokens;
-        cur.push(unit);
-    }
-    flush_units(&mut chunks, &mut cur, &mut cur_tokens, split_at);
-
+    let mut chunks = greedy_pack(tokens, boundaries, range, split_at, budget, diagnostics);
     pairwise_rebalance(&mut chunks, tokens, boundaries, split_at, budget);
     chunks
 }
@@ -312,7 +279,7 @@ fn next_effective_level(
 /// Final doc-wide rebalance between the last two chunks. Preserved verbatim in semantics from
 /// the pre-recursion implementation so documents with no overrun keep the same chunk layout.
 fn rebalance_last_two(
-    chunks: &mut Vec<PlannedChunk>,
+    chunks: &mut [PlannedChunk],
     tokens: &[usize],
     boundaries: &[BoundaryLevel],
     split_at: BoundaryLevel,
@@ -321,21 +288,8 @@ fn rebalance_last_two(
     if chunks.len() < 2 {
         return;
     }
-    let last_level = chunks.last().unwrap().effective_level;
-    let second_last_level = chunks[chunks.len() - 2].effective_level;
-
-    let last = chunks.pop().unwrap();
-    let second_last = chunks.pop().unwrap();
-    let combined: Vec<u32> = second_last.pages.iter().chain(last.pages.iter()).copied().collect();
-    let original_cut_idx = second_last.pages.len() - 1;
-
-    let pick = best_balanced_cut(&combined, tokens, boundaries, split_at, budget)
-        .unwrap_or(original_cut_idx);
-
-    let new_left: Vec<u32> = combined[..=pick].to_vec();
-    let new_right: Vec<u32> = combined[pick + 1..].to_vec();
-    chunks.push(PlannedChunk { pages: new_left, effective_level: second_last_level });
-    chunks.push(PlannedChunk { pages: new_right, effective_level: last_level });
+    let i = chunks.len() - 2;
+    try_rebalance_pair(chunks, i, tokens, boundaries, split_at, budget);
 }
 
 /// Pairwise-sweep rebalance across all adjacent chunk pairs. Stops when a full pass makes no

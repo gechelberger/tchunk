@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use rayon::ThreadPool;
 
 use tchunk_pdf::cli::{Cli, TokenizerKind};
-use tchunk_pdf::index::{self, ChunkEntry, Config, Index, Pages, Source, Warning};
+use tchunk_pdf::index::{ChunkEntry, Config, Index, Pages, Source, Warning};
 use tchunk_pdf::pdf::Pdf;
 use tchunk_pdf::plan::{plan_chunks, BoundaryLevel, Diagnostic};
 use tchunk_pdf::tokenize::{HuggingFaceTokenizer, TiktokenTokenizer, Tokenizer, WordCountTokenizer};
@@ -101,7 +101,7 @@ fn process_input(
     let extract_elapsed = t_extract.elapsed();
     extract_pb.finish();
 
-    let tok_pb = page_bar(page_count as u64, "Tokenizing");
+    let tok_pb = unit_bar(page_count as u64, "Tokenizing", "pages");
     let t_tokenize = Instant::now();
     let tokens: Vec<usize> = pool.install(|| {
         texts
@@ -140,7 +140,7 @@ fn process_input(
             );
         }
         warnings.push(Warning::OutlineMissing {
-            requested: index::boundary_level_str(requested_split_at),
+            requested: requested_split_at.as_str(),
         });
         split_at = BoundaryLevel::Page;
         boundaries = vec![BoundaryLevel::Page; page_count];
@@ -191,7 +191,7 @@ fn process_input(
     let write_pb = if cli.verbose {
         ProgressBar::hidden()
     } else {
-        chunk_bar(total as u64, "Writing chunks")
+        unit_bar(total as u64, "Writing chunks", "chunks")
     };
 
     let t_write = Instant::now();
@@ -213,7 +213,7 @@ fn process_input(
             eprintln!(
                 "  {filename}: pages {first}-{last} ({} pages, {tok_sum} tokens, level {})",
                 page_nums.len(),
-                index::boundary_level_str(chunk.effective_level),
+                chunk.effective_level.as_str(),
             );
         }
 
@@ -229,7 +229,7 @@ fn process_input(
                 count: page_nums.len(),
             },
             token_count: tok_sum,
-            effective_level: index::boundary_level_str(chunk.effective_level),
+            effective_level: chunk.effective_level.as_str(),
         });
     }
     write_pb.finish();
@@ -256,8 +256,8 @@ fn process_input(
         config: Config {
             tokenizer: tokenizer.name().to_string(),
             max_tokens: cli.max_tokens,
-            split_at_requested: index::boundary_level_str(requested_split_at),
-            split_at_effective: index::boundary_level_str(effective_level),
+            split_at_requested: requested_split_at.as_str(),
+            split_at_effective: effective_level.as_str(),
         },
         chunks: chunk_entries,
         warnings,
@@ -312,27 +312,15 @@ fn spinner(msg: &str) -> ProgressBar {
     pb
 }
 
-fn page_bar(total: u64, label: &str) -> ProgressBar {
+fn unit_bar(total: u64, label: &str, unit: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{msg} [{bar:30.cyan/blue}] {pos}/{len} pages ({percent}%) [{elapsed}/eta {eta}]",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
+    let template = format!(
+        "{{msg}} [{{bar:30.cyan/blue}}] {{pos}}/{{len}} {unit} ({{percent}}%) [{{elapsed}}/eta {{eta}}]"
     );
-    pb.set_message(label.to_string());
-    pb
-}
-
-fn chunk_bar(total: u64, label: &str) -> ProgressBar {
-    let pb = ProgressBar::new(total);
     pb.set_style(
-        ProgressStyle::with_template(
-            "{msg} [{bar:30.cyan/blue}] {pos}/{len} chunks ({percent}%) [{elapsed}/eta {eta}]",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
+        ProgressStyle::with_template(&template)
+            .unwrap()
+            .progress_chars("=>-"),
     );
     pb.set_message(label.to_string());
     pb

@@ -81,8 +81,11 @@ fn split_six_page_pdf_into_three_chunks_preserves_pages() {
     assert_eq!(pdf.page_count(), 6);
 
     let tok = TiktokenTokenizer::new("cl100k_base").unwrap();
-    let texts = pdf.page_texts();
-    let tokens: Vec<usize> = texts.iter().map(|t| tok.count(t)).collect();
+    let tokens: Vec<usize> = pdf
+        .page_nums()
+        .iter()
+        .map(|&n| tok.count(&pdf.page_text(n)))
+        .collect();
     let boundaries = vec![BoundaryLevel::Page; 6];
 
     // Force multi-chunk: budget = roughly 2 pages worth.
@@ -109,15 +112,16 @@ fn split_six_page_pdf_into_three_chunks_preserves_pages() {
         );
 
         // Verify the right pages ended up in the chunk by checking extracted text.
-        let out_texts = out_pdf.page_texts();
+        let out_page_nums = out_pdf.page_nums();
         for (k, &orig_page) in page_nums.iter().enumerate() {
             let want = format!("Page {orig_page}");
+            let got = out_pdf.page_text(out_page_nums[k]);
             assert!(
-                out_texts[k].contains(&want),
+                got.contains(&want),
                 "chunk {} position {} expected text containing '{want}', got '{}'",
                 i + 1,
                 k,
-                out_texts[k]
+                got
             );
         }
     }
@@ -136,8 +140,11 @@ fn single_chunk_when_budget_exceeds_total() {
 
     let pdf = Pdf::load(&input_path).expect("load");
     let tok = TiktokenTokenizer::new("cl100k_base").unwrap();
-    let texts = pdf.page_texts();
-    let tokens: Vec<usize> = texts.iter().map(|t| tok.count(t)).collect();
+    let tokens: Vec<usize> = pdf
+        .page_nums()
+        .iter()
+        .map(|&n| tok.count(&pdf.page_text(n)))
+        .collect();
     let boundaries = vec![BoundaryLevel::Page; 3];
 
     let plan = plan_chunks(&tokens, &boundaries, BoundaryLevel::Page, 10_000);
