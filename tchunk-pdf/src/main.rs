@@ -93,14 +93,14 @@ fn run_inspect(cli: &Cli) -> Result<(), RunError> {
                 .map_err(|e| RunError::Output(anyhow::anyhow!(e)))?;
         }
         let pdf = Pdf::load(input).map_err(RunError::Input)?;
-        if pdf.page_count() == 0 {
+        let page_count = pdf.page_count();
+        if page_count == 0 {
             return Err(RunError::Input(anyhow::anyhow!(
                 "PDF contains no pages: {}",
                 input.display()
             )));
         }
         let entries = pdf.outline_entries();
-        let page_count = pdf.page_count();
         if cli.bookmarks_hist {
             inspect::print_histogram(&mut out, &entries, page_count)
                 .map_err(|e| RunError::Output(anyhow::anyhow!(e)))?;
