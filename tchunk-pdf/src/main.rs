@@ -42,6 +42,10 @@ enum RunError {
     Output(anyhow::Error),
 }
 
+fn output_error(e: io::Error) -> RunError {
+    RunError::Output(anyhow::anyhow!(e))
+}
+
 fn run(mut cli: Cli) -> Result<(), RunError> {
     cli.validate().map_err(RunError::Input)?;
 
@@ -86,11 +90,10 @@ fn run_inspect(cli: &Cli) -> Result<(), RunError> {
     for (idx, input) in cli.inputs.iter().enumerate() {
         if multi {
             if idx > 0 {
-                writeln!(out)
-                    .map_err(|e| RunError::Output(anyhow::anyhow!(e)))?;
+                writeln!(out).map_err(output_error)?;
             }
             writeln!(out, "=== {} ({}/{}) ===", input.display(), idx + 1, cli.inputs.len())
-                .map_err(|e| RunError::Output(anyhow::anyhow!(e)))?;
+                .map_err(output_error)?;
         }
         let pdf = Pdf::load(input).map_err(RunError::Input)?;
         let page_count = pdf.page_count();
@@ -102,12 +105,10 @@ fn run_inspect(cli: &Cli) -> Result<(), RunError> {
         }
         let entries = pdf.outline_entries();
         if cli.bookmarks_hist {
-            inspect::print_histogram(&mut out, &entries, page_count)
-                .map_err(|e| RunError::Output(anyhow::anyhow!(e)))?;
+            inspect::print_histogram(&mut out, &entries, page_count).map_err(output_error)?;
         }
         if cli.bookmarks_tree {
-            inspect::print_tree(&mut out, &entries, page_count)
-                .map_err(|e| RunError::Output(anyhow::anyhow!(e)))?;
+            inspect::print_tree(&mut out, &entries, page_count).map_err(output_error)?;
         }
     }
     Ok(())

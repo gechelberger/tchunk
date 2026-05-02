@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -8,8 +9,11 @@ use tchunk_pdf::pdf::{OutlineEntry, Pdf};
 use tchunk_pdf::plan::{plan_chunks, Boundary, SplitAt};
 use tchunk_pdf::tokenize::{TiktokenTokenizer, Tokenizer};
 
-/// Build a synthetic N-page PDF where each page contains the text "Page <n>". Returns the bytes.
-fn synthesize_pdf(page_count: usize) -> Vec<u8> {
+/// Build a doc with `page_count` simple text pages and the `/Pages` dictionary inserted.
+/// Returns the doc, the `/Pages` ObjectId, and the page references in document order
+/// (the same refs are also stored in `/Pages /Kids` — the caller can reuse them to wire
+/// outline `/Dest` arrays or `/OpenAction` targets without walking the doc).
+fn build_doc_pages(page_count: usize) -> (Document, lopdf::ObjectId, Vec<Object>) {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
 
@@ -24,76 +28,12 @@ fn synthesize_pdf(page_count: usize) -> Vec<u8> {
 
     let mut page_ids: Vec<Object> = Vec::with_capacity(page_count);
     for i in 1..=page_count {
-        let text = format!("Page {i}");
         let content = Content {
             operations: vec![
                 Operation::new("BT", vec![]),
                 Operation::new("Tf", vec!["F1".into(), 24.into()]),
                 Operation::new("Td", vec![100.into(), 700.into()]),
-                Operation::new("Tj", vec![Object::string_literal(text)]),
-                Operation::new("ET", vec![]),
-            ],
-        };
-        let content_id =
-            doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-        });
-        page_ids.push(page_id.into());
-    }
-
-    let pages = dictionary! {
-        "Type" => "Pages",
-        "Kids" => page_ids,
-        "Count" => page_count as i64,
-        "Resources" => resources_id,
-        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-    };
-    doc.objects.insert(pages_id, Object::Dictionary(pages));
-
-    let catalog_id = doc.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => pages_id,
-    });
-    doc.trailer.set("Root", catalog_id);
-    doc.compress();
-
-    let mut out = Vec::new();
-    doc.save_to(&mut out).expect("save_to memory buffer");
-    out
-}
-
-/// Synthesize an N-page PDF with the given outline. Each outline entry is a
-/// `(depth, page_num, title)` triple. Depth is 1-based; entries must be given
-/// in document order. The function constructs the parent/child/sibling references
-/// of a valid PDF outline tree from this flat list.
-fn synthesize_pdf_with_outline(
-    page_count: usize,
-    outline: &[(u32, u32, &str)],
-) -> Vec<u8> {
-    let mut doc = Document::with_version("1.5");
-    let pages_id = doc.new_object_id();
-
-    let font_id = doc.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica",
-    });
-    let resources_id = doc.add_object(dictionary! {
-        "Font" => dictionary! { "F1" => font_id },
-    });
-
-    let mut page_ids: Vec<Object> = Vec::with_capacity(page_count);
-    for i in 1..=page_count {
-        let text = format!("Page {i}");
-        let content = Content {
-            operations: vec![
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec!["F1".into(), 24.into()]),
-                Operation::new("Td", vec![100.into(), 700.into()]),
-                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("Tj", vec![Object::string_literal(format!("Page {i}"))]),
                 Operation::new("ET", vec![]),
             ],
         };
@@ -116,43 +56,87 @@ fn synthesize_pdf_with_outline(
     };
     doc.objects.insert(pages_id, Object::Dictionary(pages));
 
+    (doc, pages_id, page_ids)
+}
+
+/// Finalize a document: set `/Root` to `catalog_id`, compress, and serialize to bytes.
+fn finalize_doc(mut doc: Document, catalog_id: lopdf::ObjectId) -> Vec<u8> {
+    doc.trailer.set("Root", catalog_id);
+    doc.compress();
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("save_to memory buffer");
+    out
+}
+
+/// Build a synthetic N-page PDF where each page contains the text "Page <n>". Returns the bytes.
+fn synthesize_pdf(page_count: usize) -> Vec<u8> {
+    let (mut doc, pages_id, _page_ids) = build_doc_pages(page_count);
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    finalize_doc(doc, catalog_id)
+}
+
+/// Synthesize an N-page PDF with the given outline. Each outline entry is a
+/// `(depth, page_num, title)` triple. Depth is 1-based; entries must be given
+/// in document order. The function constructs the parent/child/sibling references
+/// of a valid PDF outline tree from this flat list.
+fn synthesize_pdf_with_outline(
+    page_count: usize,
+    outline: &[(u32, u32, &str)],
+) -> Vec<u8> {
+    let (mut doc, pages_id, page_ids) = build_doc_pages(page_count);
+
     // Reserve object IDs for each outline item up front so /First /Last /Next /Prev /Parent
-    // references can use them before the items themselves exist.
+    // references can be wired without forward declarations.
     let item_ids: Vec<lopdf::ObjectId> =
         (0..outline.len()).map(|_| doc.new_object_id()).collect();
     let outlines_id = doc.new_object_id();
 
-    // A dummy object used as the page reference for out-of-range entries. lopdf's get_toc
-    // requires all page destinations to be Object::Reference (it calls as_reference()?), so we
-    // use a valid reference to a non-page object rather than an Object::Integer. The dummy ID
-    // won't be in page_id_to_page_numbers, so get_toc silently skips such entries.
+    // lopdf's get_toc calls as_reference()? on the page field, so Object::Integer would
+    // crash the whole walk. A reference to a non-page object passes as_reference() but
+    // isn't in page_id_to_page_numbers, so get_toc silently skips it — the behavior we
+    // want for out-of-range outline entries.
     let dummy_id = doc.add_object(Object::Null);
 
-    // Build parent/child links by walking entries with a depth stack.
-    // `parent_at_depth[d]` = item id of the most-recent open item at depth d (if any);
-    //   read on the `else` branch below to locate the parent of each deeper entry.
+    // Single pass over `outline` builds parent links, child counts, sibling chains, and
+    // top-level state. `parent_at_depth[d]` holds the most-recent open item at depth d so
+    // each entry can find its parent at depth d-1. `last_idx_at[parent]` holds the last
+    // child index seen so each new sibling can be doubly-linked to its predecessor.
+    let mut item_parent: Vec<lopdf::ObjectId> = Vec::with_capacity(outline.len());
+    let mut prev_sibling: Vec<Option<lopdf::ObjectId>> = vec![None; outline.len()];
+    let mut next_sibling: Vec<Option<lopdf::ObjectId>> = vec![None; outline.len()];
+    let mut first_child_of: HashMap<lopdf::ObjectId, lopdf::ObjectId> = HashMap::new();
+    let mut last_child_of: HashMap<lopdf::ObjectId, lopdf::ObjectId> = HashMap::new();
+    let mut child_count_of: HashMap<lopdf::ObjectId, i64> = HashMap::new();
+    let mut last_idx_at: HashMap<lopdf::ObjectId, usize> = HashMap::new();
     let mut parent_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
-    let mut first_child_of: std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId> =
-        std::collections::HashMap::new();
-    let mut last_child_of: std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId> =
-        std::collections::HashMap::new();
-    let mut child_count_of: std::collections::HashMap<lopdf::ObjectId, i64> =
-        std::collections::HashMap::new();
     let mut top_level_count: i64 = 0;
     let mut top_level_first: Option<lopdf::ObjectId> = None;
     let mut top_level_last: Option<lopdf::ObjectId> = None;
 
     for (i, &(depth, _page, _title)) in outline.iter().enumerate() {
         let d = depth as usize;
-        // When we step shallower or to a sibling, clear deeper levels' state.
         for slot in parent_at_depth.iter_mut().skip(d + 1) {
             *slot = None;
         }
-        // Record this item as the parent for any deeper items that follow.
         parent_at_depth[d] = Some(item_ids[i]);
 
-        // Wire as sibling under current parent.
-        let parent_id = if d == 1 { outlines_id } else { parent_at_depth[d - 1].expect("orphan outline entry: depth > 1 with no parent at depth-1") };
+        let parent_id = if d == 1 {
+            outlines_id
+        } else {
+            parent_at_depth[d - 1]
+                .expect("orphan outline entry: depth > 1 with no parent at depth-1")
+        };
+        item_parent.push(parent_id);
+
+        if let Some(&prev_idx) = last_idx_at.get(&parent_id) {
+            next_sibling[prev_idx] = Some(item_ids[i]);
+            prev_sibling[i] = Some(item_ids[prev_idx]);
+        }
+        last_idx_at.insert(parent_id, i);
+
         if d == 1 {
             top_level_count += 1;
             if top_level_first.is_none() {
@@ -166,65 +150,15 @@ fn synthesize_pdf_with_outline(
         }
     }
 
-    // Now build sibling /Next /Prev links via a second pass that, for each item, finds
-    // its previous sibling and next sibling under the same parent.
-    let mut prev_sibling: Vec<Option<lopdf::ObjectId>> = vec![None; outline.len()];
-    let mut next_sibling: Vec<Option<lopdf::ObjectId>> = vec![None; outline.len()];
-    {
-        // For each parent (including outlines_id for top-level), collect children in order
-        // and link them.
-        let mut children_of: std::collections::HashMap<lopdf::ObjectId, Vec<usize>> =
-            std::collections::HashMap::new();
-        let mut local_parent_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
-        for (i, &(depth, _page, _title)) in outline.iter().enumerate() {
-            let d = depth as usize;
-            for slot in local_parent_at_depth.iter_mut().skip(d + 1) {
-                *slot = None;
-            }
-            let parent_id = if d == 1 { outlines_id } else { local_parent_at_depth[d - 1].expect("orphan") };
-            children_of.entry(parent_id).or_default().push(i);
-            local_parent_at_depth[d] = Some(item_ids[i]);
-        }
-        for siblings in children_of.values() {
-            for w in siblings.windows(2) {
-                next_sibling[w[0]] = Some(item_ids[w[1]]);
-                prev_sibling[w[1]] = Some(item_ids[w[0]]);
-            }
-        }
-    }
-
-    // Emit each outline item dictionary at its reserved ID.
-    for (i, &(depth, page, title)) in outline.iter().enumerate() {
-        let d = depth as usize;
-        let parent_id = if d == 1 {
-            outlines_id
-        } else {
-            // The parent at depth d-1 captured during the first pass. Re-derive it here
-            // by scanning backwards for the closest entry at depth d-1.
-            let mut p: Option<lopdf::ObjectId> = None;
-            for j in (0..i).rev() {
-                if outline[j].0 == depth - 1 {
-                    p = Some(item_ids[j]);
-                    break;
-                }
-                if outline[j].0 < depth - 1 {
-                    panic!("orphan outline entry at index {i}: jumped from depth {} to {}", outline[j].0, depth);
-                }
-            }
-            p.expect("no parent found for non-top-level outline entry")
-        };
+    for (i, &(_depth, page, title)) in outline.iter().enumerate() {
         let page_ref = if (page as usize) >= 1 && (page as usize) <= page_count {
             page_ids[(page - 1) as usize].clone()
         } else {
-            // Out-of-range: use a reference to the dummy object. lopdf's get_toc calls
-            // as_reference()? on the page field, so Object::Integer would cause the entire
-            // get_toc call to fail. A reference to a non-page object passes as_reference()
-            // but isn't found in page_id_to_page_numbers, so get_toc silently skips it.
             Object::Reference(dummy_id)
         };
         let mut item = dictionary! {
             "Title" => Object::string_literal(title),
-            "Parent" => Object::Reference(parent_id),
+            "Parent" => Object::Reference(item_parent[i]),
             "Dest" => Object::Array(vec![
                 page_ref,
                 Object::Name(b"Fit".to_vec()),
@@ -244,7 +178,6 @@ fn synthesize_pdf_with_outline(
         doc.objects.insert(item_ids[i], Object::Dictionary(item));
     }
 
-    // Emit the root /Outlines dictionary.
     let mut outlines_dict = dictionary! {
         "Type" => "Outlines",
         "Count" => top_level_count,
@@ -257,18 +190,12 @@ fn synthesize_pdf_with_outline(
     }
     doc.objects.insert(outlines_id, Object::Dictionary(outlines_dict));
 
-    // Catalog references both /Pages and /Outlines.
     let catalog_id = doc.add_object(dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
         "Outlines" => Object::Reference(outlines_id),
     });
-    doc.trailer.set("Root", catalog_id);
-    doc.compress();
-
-    let mut out = Vec::new();
-    doc.save_to(&mut out).expect("save_to memory buffer");
-    out
+    finalize_doc(doc, catalog_id)
 }
 
 #[test]
@@ -367,64 +294,17 @@ fn single_chunk_when_budget_exceeds_total() {
 /// verify that subsetting drops the catalog action so a dropped page can't survive in the chunk
 /// via `prune_objects` reachability.
 fn synthesize_pdf_with_open_action(page_count: usize, target_page: usize) -> Vec<u8> {
-    let mut doc = Document::with_version("1.5");
-    let pages_id = doc.new_object_id();
-
-    let font_id = doc.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica",
-    });
-    let resources_id = doc.add_object(dictionary! {
-        "Font" => dictionary! { "F1" => font_id },
-    });
-
-    let mut page_ids: Vec<Object> = Vec::with_capacity(page_count);
-    for i in 1..=page_count {
-        let content = Content {
-            operations: vec![
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec!["F1".into(), 24.into()]),
-                Operation::new("Td", vec![100.into(), 700.into()]),
-                Operation::new("Tj", vec![Object::string_literal(format!("Page {i}"))]),
-                Operation::new("ET", vec![]),
-            ],
-        };
-        let content_id =
-            doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-        });
-        page_ids.push(page_id.into());
-    }
-
+    let (mut doc, pages_id, page_ids) = build_doc_pages(page_count);
     let target_page_id = match &page_ids[target_page - 1] {
         Object::Reference(id) => *id,
         _ => unreachable!("page_ids contains References"),
     };
-
-    let pages = dictionary! {
-        "Type" => "Pages",
-        "Kids" => page_ids,
-        "Count" => page_count as i64,
-        "Resources" => resources_id,
-        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-    };
-    doc.objects.insert(pages_id, Object::Dictionary(pages));
-
     let catalog_id = doc.add_object(dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
         "OpenAction" => vec![Object::Reference(target_page_id), "Fit".into()],
     });
-    doc.trailer.set("Root", catalog_id);
-    doc.compress();
-
-    let mut out = Vec::new();
-    doc.save_to(&mut out).expect("save_to memory buffer");
-    out
+    finalize_doc(doc, catalog_id)
 }
 
 #[test]
