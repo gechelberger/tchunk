@@ -132,7 +132,8 @@ pub struct Cli {
     /// Print a depth histogram of the input's outline and exit. Combinable with
     /// --bookmarks-tree. Inspection mode skips chunking entirely; --max-tokens,
     /// --split-at, --split-at-depth, --tokenizer, --tokenizer-file,
-    /// --tokenizer-model, --output-dir, --prefix, and -j are silently ignored.
+    /// --tokenizer-model, --output-dir, --prefix, -j, -q, and -v are silently
+    /// ignored.
     #[arg(long = "bookmarks-hist")]
     pub bookmarks_hist: bool,
 

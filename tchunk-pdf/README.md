@@ -139,8 +139,8 @@ $ tchunk-pdf my-textbook.pdf --bookmarks-hist
 ```
 
 In inspection mode all chunking-related flags (`-m`, `-s`, `--split-at-depth`,
-`-t`, `--tokenizer-file`, `--tokenizer-model`, `-o`, `-p`, `-j`) are silently
-ignored. With multiple inputs, each file is printed in its own
+`-t`, `--tokenizer-file`, `--tokenizer-model`, `-o`, `-p`, `-j`, `-q`, `-v`) are
+silently ignored. With multiple inputs, each file is printed in its own
 `=== file.pdf (i/N) ===` block, separated by a blank line.
 
 ### Caveat: synthetic page-1 cut

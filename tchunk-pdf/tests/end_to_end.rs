@@ -145,8 +145,8 @@ fn synthesize_pdf_with_outline(
     for (i, &(depth, _page, _title)) in outline.iter().enumerate() {
         let d = depth as usize;
         // When we step shallower or to a sibling, clear deeper levels' state.
-        for deeper in (d + 1)..parent_at_depth.len() {
-            parent_at_depth[deeper] = None;
+        for slot in parent_at_depth.iter_mut().skip(d + 1) {
+            *slot = None;
         }
         // Record this item as the parent for any deeper items that follow.
         parent_at_depth[d] = Some(item_ids[i]);
@@ -178,8 +178,8 @@ fn synthesize_pdf_with_outline(
         let mut local_parent_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
         for (i, &(depth, _page, _title)) in outline.iter().enumerate() {
             let d = depth as usize;
-            for deeper in (d + 1)..local_parent_at_depth.len() {
-                local_parent_at_depth[deeper] = None;
+            for slot in local_parent_at_depth.iter_mut().skip(d + 1) {
+                *slot = None;
             }
             let parent_id = if d == 1 { outlines_id } else { local_parent_at_depth[d - 1].expect("orphan") };
             children_of.entry(parent_id).or_default().push(i);
