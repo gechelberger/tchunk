@@ -641,3 +641,123 @@ fn outline_entries_skips_out_of_range_pages() {
     assert_eq!(entries[0].page, 1);
     assert_eq!(entries[1].page, 3);
 }
+
+#[test]
+fn inspection_mode_writes_no_chunks_or_sidecar() {
+    let outline: Vec<(u32, u32, &str)> = vec![
+        (1, 1, "Chapter 1"),
+        (2, 2, "Section 1.1"),
+        (1, 3, "Chapter 2"),
+    ];
+    let bytes = synthesize_pdf_with_outline(3, &outline);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-inspect-no-chunks-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    // Run the binary with --bookmarks-hist. Use cargo's compiled binary path.
+    let bin_path = env!("CARGO_BIN_EXE_tchunk-pdf");
+    let output = Command::new(bin_path)
+        .arg(&input_path)
+        .arg("--bookmarks-hist")
+        .arg("--output-dir")
+        .arg(&dir)
+        .output()
+        .expect("run tchunk-pdf");
+    assert!(output.status.success(), "non-zero exit: stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+
+    // No PDF chunks should have been created in the output dir (other than the input).
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        !entries.iter().any(|n| n != "input.pdf" && n.ends_with(".pdf")),
+        "unexpected chunk PDF created: {entries:?}",
+    );
+    assert!(
+        !entries.iter().any(|n| n.ends_with(".index.json")),
+        "unexpected sidecar created: {entries:?}",
+    );
+
+    // Stdout should contain the histogram body.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("3 pages, 3 bookmarks, max depth 2"),
+        "missing histogram header in stdout: {stdout}");
+    assert!(stdout.contains("at depth 1: 2 bookmarks"),
+        "missing depth-1 row in stdout: {stdout}");
+    assert!(stdout.contains("at depth 2: 1 bookmark"),
+        "missing depth-2 row in stdout: {stdout}");
+}
+
+#[test]
+fn inspection_mode_multi_file_framing() {
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-inspect-multi-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let outline_a: Vec<(u32, u32, &str)> = vec![(1, 1, "A.Ch1")];
+    let outline_b: Vec<(u32, u32, &str)> = vec![(1, 1, "B.Ch1")];
+    let path_a = dir.join("a.pdf");
+    let path_b = dir.join("b.pdf");
+    std::fs::write(&path_a, synthesize_pdf_with_outline(2, &outline_a)).unwrap();
+    std::fs::write(&path_b, synthesize_pdf_with_outline(2, &outline_b)).unwrap();
+
+    let bin_path = env!("CARGO_BIN_EXE_tchunk-pdf");
+    let output = Command::new(bin_path)
+        .arg(&path_a)
+        .arg(&path_b)
+        .arg("--bookmarks-hist")
+        .output()
+        .expect("run tchunk-pdf");
+    assert!(output.status.success(), "non-zero exit: stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("=== ") && stdout.contains("(1/2) ==="),
+        "missing first-file frame: {stdout}");
+    assert!(stdout.contains("(2/2) ==="),
+        "missing second-file frame: {stdout}");
+    // Per-file blocks should be separated by a blank line.
+    assert!(stdout.contains("\n\n==="),
+        "expected blank line between per-file blocks: {stdout:?}");
+}
+
+#[test]
+fn inspection_mode_combined_flags_emit_histogram_then_tree() {
+    let outline: Vec<(u32, u32, &str)> = vec![
+        (1, 1, "Chapter 1"),
+        (2, 2, "Section 1.1"),
+    ];
+    let bytes = synthesize_pdf_with_outline(2, &outline);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-inspect-combined-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let bin_path = env!("CARGO_BIN_EXE_tchunk-pdf");
+    let output = Command::new(bin_path)
+        .arg(&input_path)
+        .arg("--bookmarks-hist")
+        .arg("--bookmarks-tree")
+        .output()
+        .expect("run tchunk-pdf");
+    assert!(output.status.success(), "non-zero exit: stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let hist_idx = stdout.find("at depth 1:").expect("histogram missing from stdout");
+    let tree_idx = stdout.find("[p1]").expect("tree missing from stdout");
+    assert!(hist_idx < tree_idx,
+        "expected histogram block before tree block in stdout:\n{stdout}");
+}
