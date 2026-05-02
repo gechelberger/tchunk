@@ -113,6 +113,43 @@ Warning entries are tagged objects: `scan_like`, `image_dominant`, `outline_miss
 - **Over-budget units recurse.** If a single unit (e.g. one chapter) exceeds `--max-tokens`, tchunk-pdf treats that unit as its own sub-problem and re-plans it at the next finer outline depth (depth-1 → depth-2 → depth-3 → ... → page), balancing its sibling sub-chunks against each other rather than packing greedy-first-fit. Recursion falls through any depth with no interior boundaries. Per-chunk `effective_level` in the index sidecar shows which depth each chunk's cuts were actually taken at.
 - **Oversized pages.** A single page whose token count exceeds `--max-tokens` becomes its own output chunk with a warning.
 
+## Inspecting a PDF's outline
+
+Before running a chunk job, you can inspect a PDF's outline to choose the right
+`--split-at-depth N`. Two opt-in flags switch the program into inspection mode
+(no chunking, no sidecar, no PDFs written):
+
+- `--bookmarks-hist` — print a depth histogram. For each outline depth, shows
+  the bookmark count, the cumulative number of segments produced if you split
+  at that depth, and the min/max page span across those segments.
+- `--bookmarks-tree` — print the full indented outline tree with page numbers.
+
+Both flags are independent and combinable. With both set, the histogram prints
+first, then the tree.
+
+Example:
+
+```
+$ tchunk-pdf my-textbook.pdf --bookmarks-hist
+423 pages, 312 bookmarks, max depth 4
+  at depth 1:  12 bookmarks  → 12 segments, 5-89 pages long
+  at depth 2:  87 bookmarks  → 99 segments, 1-23 pages long
+  at depth 3: 200 bookmarks  → 299 segments, 1-12 pages long
+  at depth 4:  13 bookmarks  → 312 segments, 1-8 pages long
+```
+
+In inspection mode all chunking-related flags (`-m`, `-s`, `--split-at-depth`,
+`-t`, `-o`, `-p`, `-j`) are silently ignored. With multiple inputs, each file
+is printed in its own `=== file.pdf (i/N) ===` block, separated by a blank line.
+
+### Caveat: synthetic page-1 cut
+
+The histogram counts only real outline entries. For the rare PDF whose outline
+does not target page 1 at depth 1, the planner injects a synthetic depth-1 cut
+at page 1 so splitting is well-defined; the actual chunk count at depth N would
+be `S + 1` rather than the `S` shown in the histogram. Most real-world PDFs
+include a page-1 entry already, in which case the histogram is exact.
+
 ## Tokenizers
 
 Four options, selected with `-t/--tokenizer`:
