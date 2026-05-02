@@ -128,9 +128,29 @@ pub struct Cli {
     /// auto-detect (use all available cores). Chunk writing stays sequential.
     #[arg(short = 'j', long, default_value_t = 1)]
     pub jobs: usize,
+
+    /// Print a depth histogram of the input's outline and exit. Combinable with
+    /// --bookmarks-tree. Inspection mode skips chunking entirely; --max-tokens,
+    /// --split-at, --split-at-depth, --tokenizer, --tokenizer-file,
+    /// --tokenizer-model, --output-dir, --prefix, -j, -q, and -v are silently
+    /// ignored.
+    #[arg(long = "bookmarks-hist")]
+    pub bookmarks_hist: bool,
+
+    /// Print the full indented outline tree with page numbers and exit. Combinable
+    /// with --bookmarks-hist. Inspection mode skips chunking entirely.
+    #[arg(long = "bookmarks-tree")]
+    pub bookmarks_tree: bool,
 }
 
 impl Cli {
+    /// Whether either inspection flag is set. When true, `main.rs` takes the inspection
+    /// path and bypasses tokenizer construction, planning, chunk writing, and the index
+    /// sidecar.
+    pub fn inspection_mode(&self) -> bool {
+        self.bookmarks_hist || self.bookmarks_tree
+    }
+
     /// Resolve the user's split-at request to a `SplitAt`. `--split-at-depth N` takes
     /// precedence over the named `--split-at` flag when both are supplied (clap's
     /// ArgGroup ensures they aren't, but be explicit anyway).
@@ -157,16 +177,21 @@ impl Cli {
             validate_prefix(p)?;
         }
 
-        let has_hf_source = self.tokenizer_file.is_some() || self.tokenizer_model.is_some();
-        match self.tokenizer {
-            TokenizerKind::HuggingFace if !has_hf_source => anyhow::bail!(
-                "-t huggingface requires --tokenizer-file <PATH> or --tokenizer-model <HF_MODEL_ID>"
-            ),
-            TokenizerKind::HuggingFace => {}
-            _ if has_hf_source => anyhow::bail!(
-                "--tokenizer-file / --tokenizer-model only apply with -t huggingface"
-            ),
-            _ => {}
+        // Inspection mode never constructs a tokenizer, so the tokenizer/HF-source
+        // consistency check would only produce confusing errors for users who set
+        // --tokenizer alongside --bookmarks-hist. Skip it in that mode.
+        if !self.inspection_mode() {
+            let has_hf_source = self.tokenizer_file.is_some() || self.tokenizer_model.is_some();
+            match self.tokenizer {
+                TokenizerKind::HuggingFace if !has_hf_source => anyhow::bail!(
+                    "-t huggingface requires --tokenizer-file <PATH> or --tokenizer-model <HF_MODEL_ID>"
+                ),
+                TokenizerKind::HuggingFace => {}
+                _ if has_hf_source => anyhow::bail!(
+                    "--tokenizer-file / --tokenizer-model only apply with -t huggingface"
+                ),
+                _ => {}
+            }
         }
 
         Ok(())
@@ -323,5 +348,74 @@ mod tests {
         use clap::Parser;
         let cli = Cli::try_parse_from(["tchunk-pdf", "input.pdf"]).expect("parse");
         assert_eq!(cli.resolved_split_at(), SplitAt::Depth(1));
+    }
+
+    #[test]
+    fn bookmarks_hist_flag_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["tchunk-pdf", "input.pdf", "--bookmarks-hist"])
+            .expect("parse");
+        assert!(cli.bookmarks_hist);
+        assert!(!cli.bookmarks_tree);
+        assert!(cli.inspection_mode());
+    }
+
+    #[test]
+    fn bookmarks_tree_flag_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["tchunk-pdf", "input.pdf", "--bookmarks-tree"])
+            .expect("parse");
+        assert!(!cli.bookmarks_hist);
+        assert!(cli.bookmarks_tree);
+        assert!(cli.inspection_mode());
+    }
+
+    #[test]
+    fn bookmarks_flags_are_combinable() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "tchunk-pdf",
+            "input.pdf",
+            "--bookmarks-hist",
+            "--bookmarks-tree",
+        ])
+        .expect("parse");
+        assert!(cli.bookmarks_hist);
+        assert!(cli.bookmarks_tree);
+        assert!(cli.inspection_mode());
+    }
+
+    #[test]
+    fn inspection_mode_skips_hf_source_validation() {
+        use clap::Parser;
+        // -t huggingface without a source would normally fail validation, but in
+        // inspection mode the tokenizer is never constructed so the check is skipped.
+        // We need a real input path for validate() to pass its other checks; use a
+        // path that exists. Cargo.toml is always present at the workspace root.
+        let mut cli = Cli::try_parse_from([
+            "tchunk-pdf",
+            "Cargo.toml",
+            "-t",
+            "huggingface",
+            "--bookmarks-hist",
+        ])
+        .expect("parse");
+        assert!(cli.validate().is_ok(), "expected validate to pass in inspection mode");
+    }
+
+    #[test]
+    fn non_inspection_mode_still_enforces_hf_source() {
+        use clap::Parser;
+        let mut cli = Cli::try_parse_from(["tchunk-pdf", "Cargo.toml", "-t", "huggingface"])
+            .expect("parse");
+        let err = cli.validate().expect_err("expected error without HF source in chunking mode");
+        assert!(err.to_string().contains("requires --tokenizer-file"));
+    }
+
+    #[test]
+    fn no_inspection_flags_means_chunking_mode() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["tchunk-pdf", "input.pdf"]).expect("parse");
+        assert!(!cli.inspection_mode());
     }
 }

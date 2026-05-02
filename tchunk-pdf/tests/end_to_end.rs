@@ -1,15 +1,19 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Document, Object, Stream};
 
-use tchunk_pdf::pdf::Pdf;
+use tchunk_pdf::pdf::{OutlineEntry, Pdf};
 use tchunk_pdf::plan::{plan_chunks, Boundary, SplitAt};
 use tchunk_pdf::tokenize::{TiktokenTokenizer, Tokenizer};
 
-/// Build a synthetic N-page PDF where each page contains the text "Page <n>". Returns the bytes.
-fn synthesize_pdf(page_count: usize) -> Vec<u8> {
+/// Build a doc with `page_count` simple text pages and the `/Pages` dictionary inserted.
+/// Returns the doc, the `/Pages` ObjectId, and the page references in document order
+/// (the same refs are also stored in `/Pages /Kids` — the caller can reuse them to wire
+/// outline `/Dest` arrays or `/OpenAction` targets without walking the doc).
+fn build_doc_pages(page_count: usize) -> (Document, lopdf::ObjectId, Vec<Object>) {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
 
@@ -24,13 +28,12 @@ fn synthesize_pdf(page_count: usize) -> Vec<u8> {
 
     let mut page_ids: Vec<Object> = Vec::with_capacity(page_count);
     for i in 1..=page_count {
-        let text = format!("Page {i}");
         let content = Content {
             operations: vec![
                 Operation::new("BT", vec![]),
                 Operation::new("Tf", vec!["F1".into(), 24.into()]),
                 Operation::new("Td", vec![100.into(), 700.into()]),
-                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("Tj", vec![Object::string_literal(format!("Page {i}"))]),
                 Operation::new("ET", vec![]),
             ],
         };
@@ -46,23 +49,153 @@ fn synthesize_pdf(page_count: usize) -> Vec<u8> {
 
     let pages = dictionary! {
         "Type" => "Pages",
-        "Kids" => page_ids,
+        "Kids" => page_ids.clone(),
         "Count" => page_count as i64,
         "Resources" => resources_id,
         "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
     };
     doc.objects.insert(pages_id, Object::Dictionary(pages));
 
+    (doc, pages_id, page_ids)
+}
+
+/// Finalize a document: set `/Root` to `catalog_id`, compress, and serialize to bytes.
+fn finalize_doc(mut doc: Document, catalog_id: lopdf::ObjectId) -> Vec<u8> {
+    doc.trailer.set("Root", catalog_id);
+    doc.compress();
+    let mut out = Vec::new();
+    doc.save_to(&mut out).expect("save_to memory buffer");
+    out
+}
+
+/// Build a synthetic N-page PDF where each page contains the text "Page <n>". Returns the bytes.
+fn synthesize_pdf(page_count: usize) -> Vec<u8> {
+    let (mut doc, pages_id, _page_ids) = build_doc_pages(page_count);
     let catalog_id = doc.add_object(dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
     });
-    doc.trailer.set("Root", catalog_id);
-    doc.compress();
+    finalize_doc(doc, catalog_id)
+}
 
-    let mut out = Vec::new();
-    doc.save_to(&mut out).expect("save_to memory buffer");
-    out
+/// Synthesize an N-page PDF with the given outline. Each outline entry is a
+/// `(depth, page_num, title)` triple. Depth is 1-based; entries must be given
+/// in document order. The function constructs the parent/child/sibling references
+/// of a valid PDF outline tree from this flat list.
+fn synthesize_pdf_with_outline(
+    page_count: usize,
+    outline: &[(u32, u32, &str)],
+) -> Vec<u8> {
+    let (mut doc, pages_id, page_ids) = build_doc_pages(page_count);
+
+    // Reserve object IDs for each outline item up front so /First /Last /Next /Prev /Parent
+    // references can be wired without forward declarations.
+    let item_ids: Vec<lopdf::ObjectId> =
+        (0..outline.len()).map(|_| doc.new_object_id()).collect();
+    let outlines_id = doc.new_object_id();
+
+    // lopdf's get_toc calls as_reference()? on the page field, so Object::Integer would
+    // crash the whole walk. A reference to a non-page object passes as_reference() but
+    // isn't in page_id_to_page_numbers, so get_toc silently skips it — the behavior we
+    // want for out-of-range outline entries.
+    let dummy_id = doc.add_object(Object::Null);
+
+    // Single pass over `outline` builds parent links, child counts, sibling chains, and
+    // top-level state. `parent_at_depth[d]` holds the most-recent open item at depth d so
+    // each entry can find its parent at depth d-1. `last_idx_at[parent]` holds the last
+    // child index seen so each new sibling can be doubly-linked to its predecessor.
+    let mut item_parent: Vec<lopdf::ObjectId> = Vec::with_capacity(outline.len());
+    let mut prev_sibling: Vec<Option<lopdf::ObjectId>> = vec![None; outline.len()];
+    let mut next_sibling: Vec<Option<lopdf::ObjectId>> = vec![None; outline.len()];
+    let mut first_child_of: HashMap<lopdf::ObjectId, lopdf::ObjectId> = HashMap::new();
+    let mut last_child_of: HashMap<lopdf::ObjectId, lopdf::ObjectId> = HashMap::new();
+    let mut child_count_of: HashMap<lopdf::ObjectId, i64> = HashMap::new();
+    let mut last_idx_at: HashMap<lopdf::ObjectId, usize> = HashMap::new();
+    let mut parent_at_depth: Vec<Option<lopdf::ObjectId>> = vec![None; 32];
+    let mut top_level_count: i64 = 0;
+    let mut top_level_first: Option<lopdf::ObjectId> = None;
+    let mut top_level_last: Option<lopdf::ObjectId> = None;
+
+    for (i, &(depth, _page, _title)) in outline.iter().enumerate() {
+        let d = depth as usize;
+        for slot in parent_at_depth.iter_mut().skip(d + 1) {
+            *slot = None;
+        }
+        parent_at_depth[d] = Some(item_ids[i]);
+
+        let parent_id = if d == 1 {
+            outlines_id
+        } else {
+            parent_at_depth[d - 1]
+                .expect("orphan outline entry: depth > 1 with no parent at depth-1")
+        };
+        item_parent.push(parent_id);
+
+        if let Some(&prev_idx) = last_idx_at.get(&parent_id) {
+            next_sibling[prev_idx] = Some(item_ids[i]);
+            prev_sibling[i] = Some(item_ids[prev_idx]);
+        }
+        last_idx_at.insert(parent_id, i);
+
+        if d == 1 {
+            top_level_count += 1;
+            if top_level_first.is_none() {
+                top_level_first = Some(item_ids[i]);
+            }
+            top_level_last = Some(item_ids[i]);
+        } else {
+            *child_count_of.entry(parent_id).or_insert(0) += 1;
+            first_child_of.entry(parent_id).or_insert(item_ids[i]);
+            last_child_of.insert(parent_id, item_ids[i]);
+        }
+    }
+
+    for (i, &(_depth, page, title)) in outline.iter().enumerate() {
+        let page_ref = if (page as usize) >= 1 && (page as usize) <= page_count {
+            page_ids[(page - 1) as usize].clone()
+        } else {
+            Object::Reference(dummy_id)
+        };
+        let mut item = dictionary! {
+            "Title" => Object::string_literal(title),
+            "Parent" => Object::Reference(item_parent[i]),
+            "Dest" => Object::Array(vec![
+                page_ref,
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        };
+        if let Some(p) = prev_sibling[i] {
+            item.set("Prev", Object::Reference(p));
+        }
+        if let Some(n) = next_sibling[i] {
+            item.set("Next", Object::Reference(n));
+        }
+        if let Some(&fc) = first_child_of.get(&item_ids[i]) {
+            item.set("First", Object::Reference(fc));
+            item.set("Last", Object::Reference(*last_child_of.get(&item_ids[i]).unwrap()));
+            item.set("Count", *child_count_of.get(&item_ids[i]).unwrap_or(&0));
+        }
+        doc.objects.insert(item_ids[i], Object::Dictionary(item));
+    }
+
+    let mut outlines_dict = dictionary! {
+        "Type" => "Outlines",
+        "Count" => top_level_count,
+    };
+    if let Some(f) = top_level_first {
+        outlines_dict.set("First", Object::Reference(f));
+    }
+    if let Some(l) = top_level_last {
+        outlines_dict.set("Last", Object::Reference(l));
+    }
+    doc.objects.insert(outlines_id, Object::Dictionary(outlines_dict));
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "Outlines" => Object::Reference(outlines_id),
+    });
+    finalize_doc(doc, catalog_id)
 }
 
 #[test]
@@ -161,64 +294,17 @@ fn single_chunk_when_budget_exceeds_total() {
 /// verify that subsetting drops the catalog action so a dropped page can't survive in the chunk
 /// via `prune_objects` reachability.
 fn synthesize_pdf_with_open_action(page_count: usize, target_page: usize) -> Vec<u8> {
-    let mut doc = Document::with_version("1.5");
-    let pages_id = doc.new_object_id();
-
-    let font_id = doc.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type1",
-        "BaseFont" => "Helvetica",
-    });
-    let resources_id = doc.add_object(dictionary! {
-        "Font" => dictionary! { "F1" => font_id },
-    });
-
-    let mut page_ids: Vec<Object> = Vec::with_capacity(page_count);
-    for i in 1..=page_count {
-        let content = Content {
-            operations: vec![
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec!["F1".into(), 24.into()]),
-                Operation::new("Td", vec![100.into(), 700.into()]),
-                Operation::new("Tj", vec![Object::string_literal(format!("Page {i}"))]),
-                Operation::new("ET", vec![]),
-            ],
-        };
-        let content_id =
-            doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-        });
-        page_ids.push(page_id.into());
-    }
-
+    let (mut doc, pages_id, page_ids) = build_doc_pages(page_count);
     let target_page_id = match &page_ids[target_page - 1] {
         Object::Reference(id) => *id,
         _ => unreachable!("page_ids contains References"),
     };
-
-    let pages = dictionary! {
-        "Type" => "Pages",
-        "Kids" => page_ids,
-        "Count" => page_count as i64,
-        "Resources" => resources_id,
-        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-    };
-    doc.objects.insert(pages_id, Object::Dictionary(pages));
-
     let catalog_id = doc.add_object(dictionary! {
         "Type" => "Catalog",
         "Pages" => pages_id,
         "OpenAction" => vec![Object::Reference(target_page_id), "Fit".into()],
     });
-    doc.trailer.set("Root", catalog_id);
-    doc.compress();
-
-    let mut out = Vec::new();
-    doc.save_to(&mut out).expect("save_to memory buffer");
-    out
+    finalize_doc(doc, catalog_id)
 }
 
 #[test]
@@ -314,4 +400,250 @@ fn cli_writes_index_sidecar_with_chunk_entries() {
         expected_next = end + 1;
     }
     assert_eq!(expected_next, 7, "chunks did not cover all 6 pages");
+}
+
+#[test]
+fn outline_entries_empty_when_no_outline() {
+    let bytes = synthesize_pdf(3);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-outline-empty-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    assert!(pdf.outline_entries().is_empty(), "expected empty Vec for outlineless PDF");
+}
+
+#[test]
+fn outline_entries_in_document_order() {
+    let outline: Vec<(u32, u32, &str)> = vec![
+        (1, 1, "Chapter 1"),
+        (2, 2, "Section 1.1"),
+        (2, 3, "Section 1.2"),
+        (1, 4, "Chapter 2"),
+        (2, 5, "Section 2.1"),
+    ];
+    let bytes = synthesize_pdf_with_outline(5, &outline);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-outline-order-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    let entries = pdf.outline_entries();
+
+    let expected: Vec<OutlineEntry> = outline
+        .iter()
+        .map(|&(d, p, t)| OutlineEntry {
+            depth: d,
+            page: p,
+            title: t.to_string(),
+        })
+        .collect();
+    assert_eq!(entries, expected);
+}
+
+#[test]
+fn outline_entries_decodes_utf16be_bom_titles() {
+    // Build a PDF with a UTF-16BE-encoded title (BOM + big-endian UTF-16). lopdf's get_toc
+    // is documented in toc.rs to decode this; the test pins that behavior.
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-outline-utf16-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Synthesize a base PDF with an ASCII title, then patch the title bytes to UTF-16BE+BOM.
+    let bytes = synthesize_pdf_with_outline(2, &[(1, 1, "PLACEHOLDER")]);
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    // Reload via lopdf, find the outline item, replace its /Title with a UTF-16BE-encoded
+    // string for "Café", and re-save.
+    let mut doc = Document::load(&input_path).unwrap();
+    let object_ids: Vec<lopdf::ObjectId> = doc.objects.keys().copied().collect();
+    for id in object_ids {
+        if let Ok(dict) = doc.get_object_mut(id).and_then(Object::as_dict_mut) {
+            if dict.has(b"Title") && dict.has(b"Parent") {
+                // UTF-16BE BOM (0xFE 0xFF) followed by big-endian UTF-16 bytes for "Café".
+                let bytes: Vec<u8> = vec![
+                    0xFE, 0xFF, // BOM
+                    0x00, 0x43, // 'C'
+                    0x00, 0x61, // 'a'
+                    0x00, 0x66, // 'f'
+                    0x00, 0xE9, // 'é'
+                ];
+                // Hexadecimal survives lopdf's save/load roundtrip; Literal is the alternative
+                // per the design plan if a future lopdf version drops hex support.
+                dict.set("Title", Object::String(bytes, lopdf::StringFormat::Hexadecimal));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    std::fs::write(&input_path, &out).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    let entries = pdf.outline_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].title, "Café", "expected UTF-16BE decoded title, got {:?}", entries[0].title);
+}
+
+#[test]
+fn outline_entries_skips_out_of_range_pages() {
+    // Outline references page 99 in a 3-page document. The entry should be silently dropped.
+    let outline: Vec<(u32, u32, &str)> = vec![
+        (1, 1, "Real"),
+        (1, 99, "Out of range"),
+        (1, 3, "Also real"),
+    ];
+    let bytes = synthesize_pdf_with_outline(3, &outline);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-outline-oor-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let pdf = Pdf::load(&input_path).expect("load");
+    let entries = pdf.outline_entries();
+
+    // The "Out of range" entry should be dropped; the other two stay.
+    let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+    assert_eq!(titles, vec!["Real", "Also real"]);
+    assert_eq!(entries[0].page, 1);
+    assert_eq!(entries[1].page, 3);
+}
+
+#[test]
+fn inspection_mode_writes_no_chunks_or_sidecar() {
+    let outline: Vec<(u32, u32, &str)> = vec![
+        (1, 1, "Chapter 1"),
+        (2, 2, "Section 1.1"),
+        (1, 3, "Chapter 2"),
+    ];
+    let bytes = synthesize_pdf_with_outline(3, &outline);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-inspect-no-chunks-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    // Run the binary with --bookmarks-hist. Use cargo's compiled binary path.
+    let bin_path = env!("CARGO_BIN_EXE_tchunk-pdf");
+    let output = Command::new(bin_path)
+        .arg(&input_path)
+        .arg("--bookmarks-hist")
+        .arg("--output-dir")
+        .arg(&dir)
+        .output()
+        .expect("run tchunk-pdf");
+    assert!(output.status.success(), "non-zero exit: stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+
+    // No PDF chunks should have been created in the output dir (other than the input).
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().into_string().unwrap())
+        .collect();
+    let pdf_files: Vec<&str> = entries
+        .iter()
+        .filter(|n| n.ends_with(".pdf"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        pdf_files,
+        vec!["input.pdf"],
+        "unexpected files in output dir: {entries:?}",
+    );
+    assert!(
+        !entries.iter().any(|n| n.ends_with(".index.json")),
+        "unexpected sidecar created: {entries:?}",
+    );
+
+    // Stdout should contain the histogram body.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("3 pages, 3 bookmarks, max depth 2"),
+        "missing histogram header in stdout: {stdout}");
+    assert!(stdout.contains("at depth 1: 2 bookmarks"),
+        "missing depth-1 row in stdout: {stdout}");
+    assert!(stdout.contains("at depth 2: 1 bookmark"),
+        "missing depth-2 row in stdout: {stdout}");
+}
+
+#[test]
+fn inspection_mode_multi_file_framing() {
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-inspect-multi-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let outline_a: Vec<(u32, u32, &str)> = vec![(1, 1, "A.Ch1")];
+    let outline_b: Vec<(u32, u32, &str)> = vec![(1, 1, "B.Ch1")];
+    let path_a = dir.join("a.pdf");
+    let path_b = dir.join("b.pdf");
+    std::fs::write(&path_a, synthesize_pdf_with_outline(2, &outline_a)).unwrap();
+    std::fs::write(&path_b, synthesize_pdf_with_outline(2, &outline_b)).unwrap();
+
+    let bin_path = env!("CARGO_BIN_EXE_tchunk-pdf");
+    let output = Command::new(bin_path)
+        .arg(&path_a)
+        .arg(&path_b)
+        .arg("--bookmarks-hist")
+        .output()
+        .expect("run tchunk-pdf");
+    assert!(output.status.success(), "non-zero exit: stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(&format!("=== {} (1/2) ===", path_a.display())),
+        "missing first-file frame: {stdout}");
+    assert!(stdout.contains(&format!("=== {} (2/2) ===", path_b.display())),
+        "missing second-file frame: {stdout}");
+    // Per-file blocks should be separated by a blank line.
+    assert!(stdout.contains("\n\n==="),
+        "expected blank line between per-file blocks: {stdout:?}");
+}
+
+#[test]
+fn inspection_mode_combined_flags_emit_histogram_then_tree() {
+    let outline: Vec<(u32, u32, &str)> = vec![
+        (1, 1, "Chapter 1"),
+        (2, 2, "Section 1.1"),
+    ];
+    let bytes = synthesize_pdf_with_outline(2, &outline);
+    let dir = std::env::temp_dir().join(format!(
+        "tchunk-pdf-test-inspect-combined-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input_path = dir.join("input.pdf");
+    std::fs::write(&input_path, &bytes).unwrap();
+
+    let bin_path = env!("CARGO_BIN_EXE_tchunk-pdf");
+    let output = Command::new(bin_path)
+        .arg(&input_path)
+        .arg("--bookmarks-hist")
+        .arg("--bookmarks-tree")
+        .output()
+        .expect("run tchunk-pdf");
+    assert!(output.status.success(), "non-zero exit: stderr={}",
+        String::from_utf8_lossy(&output.stderr));
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let hist_idx = stdout.find("at depth 1:").expect("histogram missing from stdout");
+    let tree_idx = stdout.find("[p1]").expect("tree missing from stdout");
+    assert!(hist_idx < tree_idx,
+        "expected histogram block before tree block in stdout:\n{stdout}");
 }

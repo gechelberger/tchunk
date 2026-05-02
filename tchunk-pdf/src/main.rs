@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -9,6 +10,7 @@ use rayon::ThreadPool;
 
 use tchunk_pdf::cli::{Cli, TokenizerKind};
 use tchunk_pdf::index::{ChunkEntry, Config, Index, Pages, Source, Warning};
+use tchunk_pdf::inspect;
 use tchunk_pdf::pdf::Pdf;
 use tchunk_pdf::plan::{plan_chunks, Boundary, Diagnostic, SplitAt};
 use tchunk_pdf::tokenize::{HuggingFaceTokenizer, TiktokenTokenizer, Tokenizer, WordCountTokenizer};
@@ -40,8 +42,16 @@ enum RunError {
     Output(anyhow::Error),
 }
 
+fn output_error(e: io::Error) -> RunError {
+    RunError::Output(anyhow::anyhow!(e))
+}
+
 fn run(mut cli: Cli) -> Result<(), RunError> {
     cli.validate().map_err(RunError::Input)?;
+
+    if cli.inspection_mode() {
+        return run_inspect(&cli);
+    }
 
     let tokenizer: Box<dyn Tokenizer + Send + Sync> = match cli.tokenizer {
         TokenizerKind::WordCount => Box::new(WordCountTokenizer),
@@ -69,6 +79,37 @@ fn run(mut cli: Cli) -> Result<(), RunError> {
             eprintln!("=== {} ({}/{}) ===", input.display(), idx + 1, cli.inputs.len());
         }
         process_input(&cli, input, &pool, tokenizer.as_ref())?;
+    }
+    Ok(())
+}
+
+fn run_inspect(cli: &Cli) -> Result<(), RunError> {
+    let multi = cli.inputs.len() > 1;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for (idx, input) in cli.inputs.iter().enumerate() {
+        if multi {
+            if idx > 0 {
+                writeln!(out).map_err(output_error)?;
+            }
+            writeln!(out, "=== {} ({}/{}) ===", input.display(), idx + 1, cli.inputs.len())
+                .map_err(output_error)?;
+        }
+        let pdf = Pdf::load(input).map_err(RunError::Input)?;
+        let page_count = pdf.page_count();
+        if page_count == 0 {
+            return Err(RunError::Input(anyhow::anyhow!(
+                "PDF contains no pages: {}",
+                input.display()
+            )));
+        }
+        let entries = pdf.outline_entries();
+        if cli.bookmarks_hist {
+            inspect::print_histogram(&mut out, &entries, page_count).map_err(output_error)?;
+        }
+        if cli.bookmarks_tree {
+            inspect::print_tree(&mut out, &entries, page_count).map_err(output_error)?;
+        }
     }
     Ok(())
 }

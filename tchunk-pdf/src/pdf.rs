@@ -7,6 +7,19 @@ use lopdf::{Destination, Document, Object, ObjectId, Outline};
 
 use crate::plan::Boundary;
 
+/// One entry in a PDF's outline (a.k.a. bookmark). Returned by `Pdf::outline_entries`,
+/// consumed by the `inspect` module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineEntry {
+    /// 1-based outline depth, matching `Boundary::Bookmark { depth }` from `plan.rs`.
+    pub depth: u32,
+    /// 1-based page number the entry targets.
+    pub page: u32,
+    /// Decoded title text. Empty string when the outline node has no `/Title` or its
+    /// decoding produced an empty string.
+    pub title: String,
+}
+
 pub struct Pdf {
     doc: Document,
     pages: BTreeMap<u32, ObjectId>,
@@ -156,6 +169,25 @@ impl Pdf {
             Ok(Some(o)) => !o.is_empty(),
             _ => false,
         }
+    }
+
+    /// Outline entries flattened in document order (depth-first preorder over `/Outlines`).
+    /// Returns an empty `Vec` when the PDF has no outline. Entries whose destination
+    /// resolves outside the document's page range are skipped silently.
+    pub fn outline_entries(&self) -> Vec<OutlineEntry> {
+        let toc = match self.doc.get_toc() {
+            Ok(toc) => toc,
+            Err(_) => return Vec::new(),
+        };
+        toc.toc
+            .into_iter()
+            .filter(|t| t.page >= 1 && t.page <= self.pages.len())
+            .map(|t| OutlineEntry {
+                depth: t.level as u32,
+                page: t.page as u32,
+                title: t.title,
+            })
+            .collect()
     }
 
     /// Write a new PDF containing only the given 1-based page numbers, preserving original page
