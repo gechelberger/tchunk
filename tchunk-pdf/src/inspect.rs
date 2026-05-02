@@ -104,11 +104,7 @@ pub fn print_tree<W: Write>(
 /// Width in columns of "[pN]" sized for the largest page number. e.g. page_count = 423
 /// → "[p423]" → 6.
 fn page_prefix_width(page_count: usize) -> usize {
-    let digits = if page_count == 0 {
-        1
-    } else {
-        (page_count as f64).log10() as usize + 1
-    };
+    let digits = page_count.checked_ilog10().map(|l| l as usize + 1).unwrap_or(1);
     "[p".len() + digits + "]".len()
 }
 
