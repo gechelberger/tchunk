@@ -676,9 +676,15 @@ fn inspection_mode_writes_no_chunks_or_sidecar() {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().into_string().unwrap())
         .collect();
-    assert!(
-        !entries.iter().any(|n| n != "input.pdf" && n.ends_with(".pdf")),
-        "unexpected chunk PDF created: {entries:?}",
+    let pdf_files: Vec<&str> = entries
+        .iter()
+        .filter(|n| n.ends_with(".pdf"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        pdf_files,
+        vec!["input.pdf"],
+        "unexpected files in output dir: {entries:?}",
     );
     assert!(
         !entries.iter().any(|n| n.ends_with(".index.json")),
@@ -721,9 +727,9 @@ fn inspection_mode_multi_file_framing() {
         String::from_utf8_lossy(&output.stderr));
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("=== ") && stdout.contains("(1/2) ==="),
+    assert!(stdout.contains(&format!("=== {} (1/2) ===", path_a.display())),
         "missing first-file frame: {stdout}");
-    assert!(stdout.contains("(2/2) ==="),
+    assert!(stdout.contains(&format!("=== {} (2/2) ===", path_b.display())),
         "missing second-file frame: {stdout}");
     // Per-file blocks should be separated by a blank line.
     assert!(stdout.contains("\n\n==="),
